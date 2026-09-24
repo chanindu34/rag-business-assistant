@@ -45,7 +45,7 @@ Each question is answered independently, retrieval and generation don't incorpor
 
 ## Tech stack
 
-Python, Google Gemini API, ChromaDB, LangChain (text splitting), Streamlit
+Python, Google Gemini API, ChromaDB, LangChain (text splitting), Streamlit, Docker
 
 ## Run it locally
 
@@ -53,6 +53,13 @@ Python, Google Gemini API, ChromaDB, LangChain (text splitting), Streamlit
 pip install -r requirements.txt
 export GEMINI_API_KEY="your-key-here"
 streamlit run app.py
+```
+
+Or with Docker:
+
+```bash
+docker build -t rag-assistant .
+docker run -p 8501:8501 --env-file .env rag-assistant
 ```
 
 ## What I'd build next

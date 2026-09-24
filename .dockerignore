@@ -1,0 +1,14 @@
+.git
+.env
+__pycache__/
+*.pyc
+.DS_Store
+*.pdf
+run_rag_eval.py
+run_rag_eval.py.bak.old
+requirements-eval.txt
+rag_eval_test_set.json
+rag_eval_results.json
+rag_eval_results.csv
+dump_chunks.py
+all_chunks_dump.json
