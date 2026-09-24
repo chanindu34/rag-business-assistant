@@ -1,0 +1,15 @@
+.env
+*.pdf
+.DS_Store
+__pycache__/
+*.pyc
+
+# Eval work in progress, not ready to publish yet
+run_rag_eval.py
+run_rag_eval.py.bak
+requirements-eval.txt
+rag_eval_test_set.json
+rag_eval_results.json
+rag_eval_results.csv
+dump_chunks.py
+all_chunks_dump.json
