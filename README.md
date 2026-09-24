@@ -62,6 +62,22 @@ docker build -t rag-assistant .
 docker run -p 8501:8501 --env-file .env rag-assistant
 ```
 
+## Rebuilding the vector store
+
+`ingest.py` is the one-time script that chunked the source annual report with
+LangChain's RecursiveCharacterTextSplitter and built the committed `chroma_db/`
+store. It is not part of the running app and does not need to be re-run to use
+the assistant. To re-run it against a new document:
+
+```bash
+pip install -r requirements-ingest.txt
+export GEMINI_API_KEY="your-key-here"
+python ingest.py
+```
+
+Requires the source PDF locally as `Annual Report.pdf` (not committed here due
+to its size).
+
 ## What I'd build next
 
 - **Layout-aware document parsing** (e.g. LlamaParse) to properly handle the tabular sections that are currently excluded, preserving table structure as Markdown instead of dropping them entirely
