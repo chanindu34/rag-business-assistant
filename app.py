@@ -1,9 +1,33 @@
+"""
+Business Intelligence Assistant
+
+Streamlit chat app that answers questions about John Keells Holdings'
+Annual Report 2025/26 using retrieval-augmented generation over a
+ChromaDB vector store, with numbered source citations.
+"""
+
+import logging
 import os
 import time
-from google import genai
+from typing import Dict, List
+
 import chromadb
-from chromadb import EmbeddingFunction
 import streamlit as st
+from chromadb import EmbeddingFunction
+from google import genai
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+GENERATION_MODEL = "gemini-2.5-flash"
+COLLECTION_NAME = "day10_documents"
+CHROMA_DB_PATH = "chroma_db"
+
+DEFAULT_TOP_K = 6
+MAX_RETRIES = 5
+EMBED_RATE_LIMIT_DELAY_SECONDS = 0.7
+SOURCE_PREVIEW_CHARS = 300
 
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
@@ -18,55 +42,64 @@ if not api_key:
 
 client_genai = genai.Client(api_key=api_key)
 
-def get_embedding(text, max_retries=5):
+
+def get_embedding(text: str, max_retries: int = MAX_RETRIES) -> List[float]:
+    """Embed text via the Gemini embedding API, retrying with exponential backoff."""
     for attempt in range(max_retries):
         try:
             result = client_genai.models.embed_content(
-                model="gemini-embedding-001",
+                model=EMBEDDING_MODEL,
                 contents=text
             )
             return result.embeddings[0].values
         except Exception:
+            logger.warning("Embedding attempt %d/%d failed", attempt + 1, max_retries, exc_info=True)
             time.sleep(2 ** attempt)
     raise RuntimeError("Failed to embed after retries.")
 
-def generate_with_retry(prompt, max_retries=5):
+
+def generate_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> str:
+    """Generate a response via the Gemini generation API, retrying with exponential backoff."""
     for attempt in range(max_retries):
         try:
             response = client_genai.models.generate_content(
-                model="gemini-2.5-flash",
+                model=GENERATION_MODEL,
                 contents=prompt
             )
             return response.text
         except Exception:
+            logger.warning("Generation attempt %d/%d failed", attempt + 1, max_retries, exc_info=True)
             time.sleep(2 ** attempt)
     raise RuntimeError("Failed to generate after retries.")
 
-class GeminiEmbeddingFunction(EmbeddingFunction):
-    def __init__(self):
-        pass
 
-    def __call__(self, input):
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    """Chroma embedding function backed by the Gemini embedding API."""
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
         embeddings = []
         for text in input:
             embeddings.append(get_embedding(text))
-            time.sleep(0.7)
+            time.sleep(EMBED_RATE_LIMIT_DELAY_SECONDS)
         return embeddings
 
-db_client = chromadb.PersistentClient(path="chroma_db")
+
+db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
 collection = db_client.get_or_create_collection(
-    name="day10_documents",
+    name=COLLECTION_NAME,
     embedding_function=GeminiEmbeddingFunction()
 )
 
 
-def retrieve(query, k=6):
+def retrieve(query: str, k: int = DEFAULT_TOP_K) -> List[str]:
+    """Retrieve the top-k most relevant chunks for a query."""
     results = collection.query(query_texts=[query], n_results=k)
     return results["documents"][0]
 
 
-def build_prompt(query, chunks):
+def build_prompt(query: str, chunks: List[str]) -> str:
+    """Build a grounded, citation-instructed prompt from retrieved chunks."""
     numbered_context = ""
     for i, chunk in enumerate(chunks):
         numbered_context += f"[{i+1}] {chunk}\n\n"
@@ -85,7 +118,8 @@ Answer:"""
     return prompt
 
 
-def answer(query, k=6):
+def answer(query: str, k: int = DEFAULT_TOP_K) -> Dict:
+    """Answer a question end to end: retrieve, build prompt, generate."""
     chunks = retrieve(query, k)
     prompt = build_prompt(query, chunks)
     answer_text = generate_with_retry(prompt)
@@ -188,6 +222,7 @@ if not st.session_state.messages:
                             "sources": result["sources"]
                         })
                     except Exception:
+                        logger.error("Failed to answer example question: %r", q, exc_info=True)
                         st.session_state.messages.append({
                             "role": "assistant",
                             "content": "Sorry, I hit a temporary error reaching the AI service. Please try asking again.",
@@ -202,7 +237,7 @@ for message in st.session_state.messages:
             with st.expander("Sources"):
                 for i, source in enumerate(message["sources"]):
                     st.markdown(
-                        f'<span class="citation-badge">{i+1}</span> {source[:300]}...',
+                        f'<span class="citation-badge">{i+1}</span> {source[:SOURCE_PREVIEW_CHARS]}...',
                         unsafe_allow_html=True
                     )
 
@@ -222,7 +257,7 @@ if user_question:
                 with st.expander("Sources"):
                     for i, source in enumerate(result["sources"]):
                         st.markdown(
-                            f'<span class="citation-badge">{i+1}</span> {source[:300]}...',
+                            f'<span class="citation-badge">{i+1}</span> {source[:SOURCE_PREVIEW_CHARS]}...',
                             unsafe_allow_html=True
                         )
 
@@ -232,6 +267,7 @@ if user_question:
                     "sources": result["sources"]
                 })
             except Exception:
+                logger.error("Failed to answer user question: %r", user_question, exc_info=True)
                 error_msg = "Sorry, I hit a temporary error reaching the AI service. Please try asking again."
                 st.error(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg, "sources": []})
