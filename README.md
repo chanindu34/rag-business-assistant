@@ -47,10 +47,35 @@ Each question is answered independently, retrieval and generation don't incorpor
 
 Python, Google Gemini API, ChromaDB, LangChain (text splitting), Streamlit, Docker
 
+## Project structure
+
+```
+app.py            Streamlit chat app (retrieval, prompt building, generation)
+ingest.py         One-time script that builds the vector store
+config.py         Loads config.yaml and exposes settings to every script
+config.yaml       Models, retrieval, chunking and rate limit settings
+chroma_db/        Persistent ChromaDB vector store (committed)
+data/             Source PDF goes here (not committed)
+.env.example      Template for API keys
+```
+
+## Configuration
+
+All tunable settings live in one place, `config.yaml`: model names, collection
+name, top-k, chunk size and overlap, page ranges, retry and rate limit values.
+Every script reads them through `config.py`, so the embedding model used to
+build the index cannot drift from the one used to query it.
+
+Any value can be overridden with an environment variable named
+`RAG_<SECTION>_<KEY>`, for example `RAG_RETRIEVAL_TOP_K=8`. Secrets (API keys)
+are never stored in `config.yaml`; they stay in `.env` or in the hosting
+platform's secrets.
+
 ## Run it locally
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env        # then put your real GEMINI_API_KEY in .env
 export GEMINI_API_KEY="your-key-here"
 streamlit run app.py
 ```
@@ -67,7 +92,13 @@ docker run -p 8501:8501 --env-file .env rag-assistant
 `ingest.py` is the one-time script that chunked the source annual report with
 LangChain's RecursiveCharacterTextSplitter and built the committed `chroma_db/`
 store. It is not part of the running app and does not need to be re-run to use
-the assistant. To re-run it against a new document:
+the assistant. To re-run it:
+
+1. Download the John Keells Holdings Annual Report 2025/26 PDF from the
+   company's investor relations page.
+2. Save it as `data/Annual Report.pdf` (the path is set by `data.pdf_path` in
+   `config.yaml`; the PDF is not committed due to its size).
+3. Run:
 
 ```bash
 pip install -r requirements-ingest.txt
@@ -75,8 +106,9 @@ export GEMINI_API_KEY="your-key-here"
 python ingest.py
 ```
 
-Requires the source PDF locally as `Annual Report.pdf` (not committed here due
-to its size).
+Ingestion is resumable: if it stops partway, re-running continues from the last
+stored batch. If you change the embedding model or chunking settings, delete
+`chroma_db/` first so the whole index is rebuilt consistently.
 
 ## What I'd build next
 

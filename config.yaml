@@ -1,0 +1,26 @@
+models:
+  embedding: gemini-embedding-001
+  generation: gemini-2.5-flash
+  judge: gemini-3.6-flash
+
+retrieval:
+  collection: jkh_annual_report_2025_26
+  db_path: chroma_db
+  top_k: 6
+
+data:
+  pdf_path: data/Annual Report.pdf
+  page_ranges:
+    - [0, 60]
+    - [138, 160]
+
+chunking:
+  size: 500
+  overlap: 50
+
+rate_limits:
+  max_retries: 5
+  embed_delay_seconds: 0.7
+
+ui:
+  source_preview_chars: 300

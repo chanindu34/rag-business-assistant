@@ -16,18 +16,19 @@ import streamlit as st
 from chromadb import EmbeddingFunction
 from google import genai
 
+from config import (
+    CHROMA_DB_PATH,
+    COLLECTION_NAME,
+    DEFAULT_TOP_K,
+    EMBED_RATE_LIMIT_DELAY_SECONDS,
+    EMBEDDING_MODEL,
+    GENERATION_MODEL,
+    MAX_RETRIES,
+    SOURCE_PREVIEW_CHARS,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-EMBEDDING_MODEL = "gemini-embedding-001"
-GENERATION_MODEL = "gemini-2.5-flash"
-COLLECTION_NAME = "day10_documents"
-CHROMA_DB_PATH = "chroma_db"
-
-DEFAULT_TOP_K = 6
-MAX_RETRIES = 5
-EMBED_RATE_LIMIT_DELAY_SECONDS = 0.7
-SOURCE_PREVIEW_CHARS = 300
 
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
@@ -86,10 +87,18 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
 
 db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
-collection = db_client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    embedding_function=GeminiEmbeddingFunction()
-)
+try:
+    collection = db_client.get_collection(
+        name=COLLECTION_NAME,
+        embedding_function=GeminiEmbeddingFunction()
+    )
+except Exception:
+    logger.exception("Could not open collection %r in %r", COLLECTION_NAME, CHROMA_DB_PATH)
+    st.error(
+        f"Collection '{COLLECTION_NAME}' was not found in '{CHROMA_DB_PATH}'. "
+        "Check config.yaml or re-run ingest.py."
+    )
+    st.stop()
 
 
 def retrieve(query: str, k: int = DEFAULT_TOP_K) -> List[str]:

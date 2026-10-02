@@ -1,3 +1,4 @@
-streamlit
-google-genai
-chromadb
+streamlit==1.64.0
+google-genai==2.24.0
+chromadb==1.5.9
+PyYAML==6.0.3

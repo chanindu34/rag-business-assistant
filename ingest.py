@@ -21,13 +21,25 @@ from chromadb import EmbeddingFunction
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
+from config import (
+    CHROMA_DB_PATH,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    COLLECTION_NAME,
+    EMBED_RATE_LIMIT_DELAY_SECONDS,
+    EMBEDDING_MODEL,
+    MAX_RETRIES,
+    PAGE_RANGES,
+    PDF_PATH,
+)
+
 client_genai = genai.Client()
 
-def get_embedding(text, max_retries=5):
+def get_embedding(text, max_retries=MAX_RETRIES):
     for attempt in range(max_retries):
         try:
             result = client_genai.models.embed_content(
-                model="gemini-embedding-001",
+                model=EMBEDDING_MODEL,
                 contents=text
             )
             return result.embeddings[0].values
@@ -46,19 +58,19 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         embeddings = []
         for text in input:
             embeddings.append(get_embedding(text))
-            time.sleep(0.7)
+            time.sleep(EMBED_RATE_LIMIT_DELAY_SECONDS)
         return embeddings
 
-db_client = chromadb.PersistentClient(path="./chroma_db")
+db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
 collection = db_client.get_or_create_collection(
-    name="day10_documents",
+    name=COLLECTION_NAME,
     embedding_function=GeminiEmbeddingFunction()
 )
 
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP
 )
 
 def load_pdf(path, start_page=0, end_page=None):
@@ -76,10 +88,8 @@ def chunk_text(text):
 
 
 def ingest(path, batch_size=50):
-    print("Loading PDF (two sections: core narrative + outlook/strategy)...")
-    text_core = load_pdf(path, start_page=0, end_page=60)
-    text_outlook = load_pdf(path, start_page=138, end_page=160)
-    text = text_core + text_outlook
+    print(f"Loading PDF (page ranges: {PAGE_RANGES})...")
+    text = "".join(load_pdf(path, start_page=start, end_page=end) for start, end in PAGE_RANGES)
     print(f"Loaded {len(text)} characters.")
 
     print("Chunking...")
@@ -106,13 +116,17 @@ def ingest(path, batch_size=50):
     print("Ingestion complete.")
 
 
-ingest("Annual Report.pdf")
-print("Final documents in collection:", collection.count())
+def main():
+    ingest(PDF_PATH)
+    print("Final documents in collection:", collection.count())
+
+    results = collection.query(
+        query_texts=["What are the biggest risks facing the company?"],
+        n_results=3
+    )
+    for i, doc in enumerate(results["documents"][0]):
+        print(f"{i+1}. {doc[:150]}...")
 
 
-results = collection.query(
-    query_texts=["What are the biggest risks facing the company?"],
-    n_results=3
-)
-for i, doc in enumerate(results["documents"][0]):
-    print(f"{i+1}. {doc[:150]}...")
+if __name__ == "__main__":
+    main()

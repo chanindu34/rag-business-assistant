@@ -1,15 +1,26 @@
+# Secrets
 .env
-*.pdf
+.streamlit/secrets.toml
+
+# OS and editor
 .DS_Store
+
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
-# Eval work in progress, not ready to publish yet
-run_rag_eval.py
-run_rag_eval.py.bak
-requirements-eval.txt
-rag_eval_test_set.json
-rag_eval_results.json
-rag_eval_results.csv
-dump_chunks.py
-all_chunks_dump.json
+# Backups and scratch
+*.bak
+*.bak.*
+*.old
+chroma_db.backup/
+
+# Local source documents (see README for where to download)
+*.pdf
+data/*
+!data/.gitkeep
+
+# Evaluation work in progress, not ready to publish yet
+evaluation/
