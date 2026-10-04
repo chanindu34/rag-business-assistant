@@ -1,0 +1,63 @@
+# Multi-stage Dockerfile - Lean Production Image
+# Stage 1: Builder
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies to /opt/venv
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime (minimal)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Security: Don't run as root
+RUN groupadd -r rag && useradd -r -g rag rag
+
+# Copy only runtime dependencies from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy application code
+COPY --chown=rag:rag app.py .
+COPY --chown=rag:rag retriever.py .
+COPY --chown=rag:rag config.py .
+COPY --chown=rag:rag ingest.py .
+COPY --chown=rag:rag index_versioning.py .
+COPY --chown=rag:rag shadow_query_logging.py .
+COPY --chown=rag:rag query_condensation.py .
+COPY --chown=rag:rag confidence_tiers.py .
+COPY --chown=rag:rag resilient_embedding.py .
+
+# Create necessary directories with correct permissions
+RUN mkdir -p /app/data /app/.index_versions /app/logs && \
+    chown -R rag:rag /app
+
+# Health check: Ensure app is responsive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8501/healthz')" || exit 1
+
+# Switch to non-root user
+USER rag
+
+# Expose port (Streamlit)
+EXPOSE 8501
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Run Streamlit app
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.headless=true"]

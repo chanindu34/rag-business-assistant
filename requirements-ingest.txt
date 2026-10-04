@@ -1,3 +1,4 @@
+# Only needed to rebuild the index (python3 ingest.py).
 -r requirements.txt
 langchain-text-splitters==1.1.2
 pypdf==6.19.0

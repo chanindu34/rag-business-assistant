@@ -5,6 +5,8 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+.cache/
+.hf/
 *.bak
 *.bak.*
 *.old
@@ -12,3 +14,7 @@ __pycache__/
 data/
 chroma_db.backup/
 evaluation/
+experimental/
+.phase*_backup/
+*.md
+!README.md

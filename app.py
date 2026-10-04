@@ -36,6 +36,7 @@ from config import (
     HYDE_FALLBACKS,
     HYDE_MODEL,
     LOW_THRESHOLD,
+    MAX_QUESTION_CHARS,
     MAX_RETRIES,
     NUM_CANDIDATES,
     USE_HYDE,
@@ -87,6 +88,30 @@ def get_embedding(text: str, max_retries: int = MAX_RETRIES) -> List[float]:
             logger.warning("Embedding attempt %d/%d failed", attempt + 1, max_retries, exc_info=True)
             time.sleep(2 ** attempt)
     raise RuntimeError("Failed to embed after retries.")
+
+
+def _setting(name: str, default):
+    """Environment variable, then Streamlit secret, then config.yaml default.
+    Lets a host (e.g. Streamlit Cloud) switch to a smaller reranker without
+    a code change."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def validate_question(raw: str):
+    """Return (clean_question, error_message). Runs before any API call."""
+    q = " ".join((raw or "").split())  # collapse whitespace and newlines
+    q = "".join(ch for ch in q if ch.isprintable())
+    if not q:
+        return None, None
+    if len(q) > MAX_QUESTION_CHARS:
+        return None, (f"That question is {len(q):,} characters long. Please keep it under "
+                      f"{MAX_QUESTION_CHARS} characters and ask about one thing at a time.")
+    return q, None
 
 
 @st.cache_resource
@@ -190,7 +215,7 @@ def load_production_rag():
         embedding_model=EMBEDDING_MODEL,
         generation_model=GENERATION_MODEL,
         llm_client=client_genai,
-        reranker_model=RERANKER_MODEL,
+        reranker_model=_setting("RAG_MODELS_RERANKER", RERANKER_MODEL),
         hyde_generate_fn=generate_hyde,
         use_hyde=USE_HYDE,
         high_threshold=HIGH_THRESHOLD,
@@ -425,8 +450,10 @@ def main():
                     for i, source in enumerate(message["sources"], 1):
                         st.markdown(f"**[{i}]** {format_source(source)}")
 
-    typed_query = st.chat_input("Ask a question...")
-    query = typed_query or st.session_state.pop("pending_query", None)
+    typed_query = st.chat_input("Ask a question...", max_chars=MAX_QUESTION_CHARS * 2)
+    query, input_error = validate_question(typed_query or st.session_state.pop("pending_query", None))
+    if input_error:
+        st.warning(input_error)
     if query:
         st.session_state.messages.append({"role": "user", "content": query})
         with st.chat_message("user"):

@@ -94,3 +94,4 @@ def parents_path(collection: str) -> str:
 
 SOURCE_PREVIEW_CHARS = _cfg["ui"]["source_preview_chars"]
 SAMPLE_QUESTIONS = _cfg["ui"].get("sample_questions", [])
+MAX_QUESTION_CHARS = int(_cfg["ui"].get("max_question_chars", 500))

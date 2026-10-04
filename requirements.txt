@@ -1,3 +1,9 @@
+# Runtime dependencies for the Streamlit app.
+# Ingestion needs extra packages: pip install -r requirements-ingest.txt
+
+# CPU-only PyTorch on Linux hosts (Streamlit Cloud, Docker). Without this,
+# pip pulls the ~2 GB CUDA build, which these hosts cannot use anyway.
+--extra-index-url https://download.pytorch.org/whl/cpu
 streamlit==1.64.0
 google-genai==2.24.0
 chromadb==1.5.9
@@ -5,5 +11,3 @@ PyYAML==6.0.3
 rank-bm25==0.2.1
 sentence-transformers==3.0.1
 numpy
-langchain-text-splitters==0.0.1
-pypdf

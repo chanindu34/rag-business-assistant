@@ -17,7 +17,9 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from google.genai import types
+import random
+
+from google.genai import errors, types
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
@@ -66,6 +68,10 @@ def tokenize(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # HyDE
 # ---------------------------------------------------------------------------
+class EmbeddingUnavailableError(RuntimeError):
+    """The query could not be embedded (quota, outage, network)."""
+
+
 class HyDETransformer:
     """Hypothetical Document Embeddings: embed a drafted answer, not the bare query."""
 
@@ -293,10 +299,30 @@ class ProductionRAG:
         self.tiers = ConfidenceTierRouter(high_threshold=high_threshold, low_threshold=low_threshold)
 
     def _embed(self, text: str, task_type: Optional[str] = None):
+        """Embed the query. Retries brief rate limits and server errors; a daily
+        quota, auth problem or repeated outage raises EmbeddingUnavailableError."""
         config = types.EmbedContentConfig(task_type=task_type) if task_type else None
-        return self.llm_client.models.embed_content(
-            model=self.embedding_model, contents=text, config=config
-        ).embeddings[0].values
+        for attempt in range(3):
+            try:
+                return self.llm_client.models.embed_content(
+                    model=self.embedding_model, contents=text, config=config
+                ).embeddings[0].values
+            except errors.ClientError as e:
+                daily = "PerDay" in str(e) or "per day" in str(e).lower()
+                if e.code == 429 and not daily and attempt < 2:
+                    time.sleep(1.5 * (attempt + 1) + random.uniform(0, 0.5))
+                    continue
+                raise EmbeddingUnavailableError(f"embedding API error {e.code}") from e
+            except errors.ServerError as e:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.5))
+                    continue
+                raise EmbeddingUnavailableError(f"embedding API error {e.code}") from e
+            except Exception as e:  # timeouts, DNS, connection resets
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise EmbeddingUnavailableError(f"embedding request failed: {type(e).__name__}") from e
 
     def _attach_context(self, item: Dict, global_idx: int) -> Dict:
         meta = self.metadatas[global_idx] or {}
@@ -322,8 +348,16 @@ class ProductionRAG:
         # 3. Hybrid: BM25 always sees the real query, dense sees the HyDE draft
         start = time.time()
         task = self.doc_task_type if hyde_used else self.query_task_type
+        # Graceful degradation: if the embedding API is down or out of quota,
+        # answer from keyword search alone instead of failing the request.
+        dense_error = None
+        try:
+            query_vector = self._embed(dense_text, task)
+        except EmbeddingUnavailableError as e:
+            logger.warning(f"Dense retrieval unavailable ({e}); using keyword search only.")
+            query_vector, dense_error = None, str(e)
         cand_ids, _ = self.retriever.retrieve_ids(
-            query, self._embed(dense_text, task), k=self.num_candidates,
+            query, query_vector, k=self.num_candidates,
             bm25_weight=self.bm25_weight, vector_weight=self.vector_weight,
         )
         candidates = [self.retriever.chunks[i] for i in cand_ids]
@@ -350,7 +384,10 @@ class ProductionRAG:
             "high_threshold": self.tiers.high_threshold,
             "low_threshold": self.tiers.low_threshold,
             "fallback_triggered": tier is ConfidenceTier.LOW,
+            "dense_unavailable": dense_error,
         }
+        if dense_error:
+            stats["method"] = "Keyword only (embedding API unavailable) + Rerank"
         if verbose:
             logger.info(f"[Retrieve] {stats}")
 

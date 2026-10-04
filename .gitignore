@@ -30,3 +30,15 @@ evaluation/
 
 # Local backups made during refactors
 .phase*_backup/
+
+# Benchmark numbers that were estimated, not measured. Not published.
+experimental/unverified/
+
+# Personal notes
+INTERVIEW_MASTERY_PLAN_5DAYS.md
+RAG_Interview_Prep.md
+INTEGRATION_GUIDE.md
+RAG_Business_Assistant_Interview_Prep.pdf
+
+# Hugging Face model cache when HF_HOME points inside the project
+.hf/
