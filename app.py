@@ -114,9 +114,14 @@ def validate_question(raw: str):
     return q, None
 
 
-@st.cache_resource
 def get_gateways():
-    """One gateway for answers, one for HyDE drafts. Shared across sessions."""
+    return _get_gateways(_code_version())
+
+
+@st.cache_resource
+def _get_gateways(code_version: str):
+    """One gateway for answers, one for HyDE drafts. Shared across sessions,
+    rebuilt when the code changes (see _code_version)."""
     answer_models = [GENERATION_MODEL] + [m for m in GENERATION_FALLBACKS if m != GENERATION_MODEL]
     hyde_models = [HYDE_MODEL] + [m for m in HYDE_FALLBACKS if m != HYDE_MODEL]
     exhausted = set()  # shared: a model that ran dry for HyDE is dry for answers too
@@ -180,9 +185,28 @@ except Exception:
     st.stop()
 
 
+def _code_version() -> str:
+    """Fingerprint of the files that shape the pipeline object.
+
+    st.cache_resource keys on the cached function's own source, so after a
+    deploy that only changes retriever.py the old pipeline object (with the
+    old methods) would be reused. Passing this fingerprint as an argument
+    forces a rebuild whenever any of these files change.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    for name in ("retriever.py", "semantic_router.py", "confidence_tiers.py", "llm.py", "config.yaml"):
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()[:12]
+
+
 @st.cache_resource
-def load_production_rag():
-    """Initialize the production RAG pipeline (cached)."""
+def load_production_rag(code_version: str):
+    """Initialize the production RAG pipeline (cached per code version)."""
     logger.info("Loading ProductionRAG pipeline...")
 
     all_results = collection.get(include=["documents", "embeddings", "metadatas"])
@@ -233,7 +257,7 @@ def load_production_rag():
     return rag
 
 
-rag_pipeline = load_production_rag()
+rag_pipeline = load_production_rag(_code_version())
 
 
 @st.cache_resource
