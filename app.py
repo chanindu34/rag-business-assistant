@@ -14,7 +14,7 @@ Includes numbered source citations.
 import logging
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import chromadb
 import streamlit as st
@@ -30,11 +30,17 @@ from config import (
     ANSWER_CACHE_PATH,
     GENERATION_FALLBACKS,
     GENERATION_MODEL,
+    BM25_WEIGHT,
+    HIGH_THRESHOLD,
     HYDE_FALLBACKS,
     HYDE_MODEL,
+    LOW_THRESHOLD,
     MAX_RETRIES,
+    NUM_CANDIDATES,
     USE_HYDE,
+    VECTOR_WEIGHT,
     RERANKER_MODEL,
+    RRF_K,
     SAMPLE_QUESTIONS,
     SOURCE_PREVIEW_CHARS,
 )
@@ -164,6 +170,12 @@ def load_production_rag():
         reranker_model=RERANKER_MODEL,
         hyde_generate_fn=generate_hyde,
         use_hyde=USE_HYDE,
+        high_threshold=HIGH_THRESHOLD,
+        low_threshold=LOW_THRESHOLD,
+        num_candidates=NUM_CANDIDATES,
+        rrf_k=RRF_K,
+        bm25_weight=BM25_WEIGHT,
+        vector_weight=VECTOR_WEIGHT,
     )
 
     return rag
@@ -178,37 +190,34 @@ def get_query_condenser():
     return QueryCondenser()
 
 
-def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None) -> tuple[List[str], Dict, str]:
-    """Retrieve using production RAG: HyDE + Hybrid + Rerank.
+def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None) -> Dict:
+    """Run the retrieval pipeline, resolving follow-up questions first.
 
-    Supports multi-turn chat by condensing history with current query.
-
-    Returns:
-        (chunks, retrieval_stats, confidence_level)
-        confidence_level: "high" or "low"
+    Returns a dict with chunks, retrieval_stats, confidence
+    ("high" | "ambiguous" | "low") and previous_question (or None).
     """
-    # Condense query with chat history for multi-turn support
-    condenser = get_query_condenser()
-    if chat_history:
-        condensed_query = condenser.condense(chat_history, query)
-        logger.info(f"[Multi-turn] Condensed '{query[:50]}...' with history")
-    else:
-        condensed_query = query
-
-    # Use condensed query for retrieval
-    result = rag_pipeline.retrieve(condensed_query, top_k=k, verbose=False)
-    chunks = [r["chunk"] for r in result["final_chunks"]]
-    confidence = result.get("confidence", "high")
-    return chunks, result["retrieval_stats"], confidence
+    condensed_query, previous_question = get_query_condenser().resolve(chat_history or [], query)
+    result = rag_pipeline.retrieve(condensed_query, top_k=k)
+    stats = result["retrieval_stats"]
+    stats["follow_up"] = previous_question is not None
+    return {
+        "chunks": [r["chunk"] for r in result["final_chunks"]],
+        "retrieval_stats": stats,
+        "confidence": result["confidence"],
+        "previous_question": previous_question,
+        "resolved_query": condensed_query,
+    }
 
 
-def build_prompt(query: str, chunks: List[str]) -> str:
+def build_prompt(query: str, chunks: List[str], previous_question: Optional[str] = None) -> str:
     """Build a grounded, citation-instructed prompt from retrieved chunks."""
-    numbered_context = ""
-    for i, chunk in enumerate(chunks):
-        numbered_context += f"[{i+1}] {chunk}\n\n"
-
-    prompt = f"""Answer the question using ONLY the information in the context below.
+    numbered_context = "".join(f"[{i+1}] {chunk}\n\n" for i, chunk in enumerate(chunks))
+    follow_up = (
+        f'This is a follow-up to the earlier question: "{previous_question}". '
+        "Interpret references like \"it\" or \"that\" accordingly.\n\n"
+        if previous_question else ""
+    )
+    return f"""Answer the question using ONLY the information in the context below.
 Do NOT use any outside knowledge, even if you recognize the company or topic.
 If specific details aren't in the context, explicitly say "the provided context doesn't cover this" rather than filling gaps from general knowledge.
 Cite which source number(s) you used in brackets after each claim, like [1] or [1][3].
@@ -217,51 +226,71 @@ Cite which source number(s) you used in brackets after each claim, like [1] or [
 {numbered_context}
 </context>
 
-Question: {query}
+{follow_up}Question: {query}
 
 Answer:"""
-    return prompt
+
+
+LOW_CONFIDENCE_MESSAGE = (
+    "I do not have sufficient internal documentation to answer this question with confidence. Please try:\n"
+    "1. Rephrasing your question more specifically\n"
+    "2. Checking if the information exists in the annual report\n"
+    "3. Searching online for additional context"
+)
+AMBIGUOUS_NOTE = (
+    "\n\n> **Moderate confidence.** The retrieved passages only partly match this question. "
+    "Check the sources below before relying on this answer."
+)
 
 
 def answer(query: str, k: int = DEFAULT_TOP_K) -> Dict:
-    """Answer a question end to end: retrieve -> prompt -> generate.
-
-    If retrieval confidence is low, returns a graceful fallback message.
-    Handles multi-turn chat by using chat history for context.
-    """
-    # Get chat history (excluding current query)
+    """Answer a question end to end: resolve follow-up, retrieve, tier, generate."""
     chat_history = st.session_state.messages[:-1] if len(st.session_state.messages) > 1 else []
-
-    chunks, retrieval_stats, confidence = retrieve(query, k, chat_history=chat_history)
+    r = retrieve(query, k, chat_history=chat_history)
+    # Remember the resolved form on the user message so later follow-ups chain.
+    st.session_state.messages[-1]["resolved_query"] = r["resolved_query"]
+    chunks, stats, confidence = r["chunks"], r["retrieval_stats"], r["confidence"]
+    base = {"retrieval_stats": stats, "confidence": confidence}
 
     if confidence == "low":
-        return {
-            "answer": "I do not have sufficient internal documentation to answer this question with confidence. Please try:\n1. Rephrasing your question more specifically\n2. Checking if the information exists in the annual report\n3. Searching online for additional context",
-            "sources": [],
-            "retrieval_stats": retrieval_stats,
-            "confidence": "low",
-        }
+        return {**base, "answer": LOW_CONFIDENCE_MESSAGE, "sources": []}
 
-    prompt = build_prompt(query, chunks)
+    prompt = build_prompt(query, chunks, r["previous_question"])
     try:
         answer_text = generate_answer(prompt)
     except QuotaExhaustedError as e:
         logger.warning("%s", e)
         return {
+            **base,
             "answer": f"I couldn't write an answer right now. {e}. "
                       "The sources I found are listed below. "
                       "Quotas reset daily (https://ai.dev/rate-limit); "
-                      "run `python list_models.py` to see which models your key can use.",
+                      "run `python3 list_models.py` to see which models your key can use.",
             "sources": chunks,
-            "retrieval_stats": retrieval_stats,
-            "confidence": confidence,
         }
-    return {
-        "answer": answer_text,
-        "sources": chunks,
-        "retrieval_stats": retrieval_stats,
-        "confidence": "high",
-    }
+
+    if confidence == "ambiguous":
+        answer_text += AMBIGUOUS_NOTE
+    return {**base, "answer": answer_text, "sources": chunks}
+
+
+TIER_ICON = {"high": "🟢", "ambiguous": "🟡", "low": "🔴"}
+
+
+def render_stats_caption(stats: Dict, confidence: str) -> None:
+    """One-line retrieval summary under each answer."""
+    parts = [
+        f"{TIER_ICON.get(confidence, '⚪')} Confidence: {confidence.upper()}"
+        + (f" ({stats['top_score']:.2f})" if "top_score" in stats else ""),
+        f"Retrieval: {stats.get('method', '?')}",
+    ]
+    if stats.get("route") == "skip_hyde":
+        parts.append("Fact lookup, HyDE skipped")
+    if stats.get("follow_up"):
+        parts.append("Follow-up resolved")
+    parts.append(f"Candidates: {stats.get('num_candidates_evaluated', '?')}")
+    parts.append(f"Rerank: {stats.get('rerank_latency_ms', 0):.0f}ms")
+    st.caption(" | ".join(parts))
 
 
 def format_source(chunk: str, max_chars: int = SOURCE_PREVIEW_CHARS) -> str:
@@ -318,15 +347,7 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("retrieval_stats"):
-                stats = message["retrieval_stats"]
-                confidence = message.get("confidence", "high")
-                confidence_color = "🟢" if confidence == "high" else "🔴"
-                st.caption(
-                    f"{confidence_color} Confidence: {confidence.upper()} | "
-                    f"Retrieval: {stats['method']} | "
-                    f"Candidates: {stats['num_candidates_evaluated']} | "
-                    f"Rerank: {stats['rerank_latency_ms']:.0f}ms"
-                )
+                render_stats_caption(message["retrieval_stats"], message.get("confidence", "high"))
             if message.get("sources"):
                 with st.expander("Sources"):
                     for i, source in enumerate(message["sources"], 1):
@@ -349,13 +370,7 @@ def main():
 
             st.markdown(answer_text)
 
-            confidence_color = "🟢" if confidence == "high" else "🔴"
-            st.caption(
-                f"{confidence_color} Confidence: {confidence.upper()} | "
-                f"Retrieval: {retrieval_stats['method']} | "
-                f"Candidates: {retrieval_stats['num_candidates_evaluated']} | "
-                f"Rerank: {retrieval_stats['rerank_latency_ms']:.0f}ms"
-            )
+            render_stats_caption(retrieval_stats, confidence)
 
             if sources:
                 with st.expander("Sources"):

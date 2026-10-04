@@ -27,3 +27,6 @@ evaluation/
 
 # Local answer cache
 .cache/
+
+# Local backups made during refactors
+.phase*_backup/

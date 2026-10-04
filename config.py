@@ -63,6 +63,12 @@ COLLECTION_NAME = _cfg["retrieval"]["collection"]
 CHROMA_DB_PATH = _cfg["retrieval"]["db_path"]
 DEFAULT_TOP_K = _cfg["retrieval"]["top_k"]
 USE_HYDE = bool(_cfg["retrieval"].get("use_hyde", True))
+NUM_CANDIDATES = int(_cfg["retrieval"].get("num_candidates", 20))
+RRF_K = int(_cfg["retrieval"].get("rrf_k", 60))
+BM25_WEIGHT = float(_cfg["retrieval"].get("bm25_weight", 1.0))
+VECTOR_WEIGHT = float(_cfg["retrieval"].get("vector_weight", 1.0))
+HIGH_THRESHOLD = float(_cfg["retrieval"].get("high_threshold", 0.6))
+LOW_THRESHOLD = float(_cfg["retrieval"].get("low_threshold", 0.35))
 
 PDF_PATH = _cfg["data"]["pdf_path"]
 PAGE_RANGES = [tuple(r) for r in _cfg["data"]["page_ranges"]]

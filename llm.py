@@ -98,6 +98,9 @@ class GeminiGateway:
         config = types.GenerateContentConfig(
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            # No tools are passed, so automatic function calling is pointless;
+            # disabling it also silences the SDK's AFC log noise.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
         for model in self.models:

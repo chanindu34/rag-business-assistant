@@ -26,6 +26,19 @@ retrieval:
   db_path: ./chroma_db
   top_k: 6
   use_hyde: true
+  # Candidates fetched by hybrid search before reranking.
+  num_candidates: 20
+  # Reciprocal Rank Fusion: score = w / (rrf_k + rank). 60 is the standard constant.
+  rrf_k: 60
+  bm25_weight: 1.0
+  vector_weight: 1.0
+  # Confidence tiers on the top reranker score (0 to 1):
+  #   >= high_threshold        HIGH: answer normally
+  #   between the two          AMBIGUOUS: answer with a caution note
+  #   <  low_threshold         LOW: decline
+  # Provisional values; calibrate them against the evaluation set in Phase 5.
+  high_threshold: 0.6
+  low_threshold: 0.35
 
 data:
   pdf_path: ./data/Annual Report.pdf
