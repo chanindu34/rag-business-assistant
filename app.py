@@ -2,8 +2,13 @@
 Business Intelligence Assistant
 
 Streamlit chat app that answers questions about John Keells Holdings'
-Annual Report 2025/26 using retrieval-augmented generation over a
-ChromaDB vector store, with numbered source citations.
+Annual Report 2025/26 using PRODUCTION RAG:
+- HyDE (hypothetical document embeddings)
+- Hybrid search (BM25 + vector with RRF)
+- Cross-encoder reranking
+- Confidence guardrails (graceful failure on low confidence)
+
+Includes numbered source citations.
 """
 
 import logging
@@ -22,10 +27,20 @@ from config import (
     DEFAULT_TOP_K,
     EMBED_RATE_LIMIT_DELAY_SECONDS,
     EMBEDDING_MODEL,
+    ANSWER_CACHE_PATH,
+    GENERATION_FALLBACKS,
     GENERATION_MODEL,
+    HYDE_FALLBACKS,
+    HYDE_MODEL,
     MAX_RETRIES,
+    USE_HYDE,
+    RERANKER_MODEL,
+    SAMPLE_QUESTIONS,
     SOURCE_PREVIEW_CHARS,
 )
+from retriever import ProductionRAG
+from query_condensation import QueryCondenser
+from llm import GeminiGateway, QuotaExhaustedError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,23 +74,35 @@ def get_embedding(text: str, max_retries: int = MAX_RETRIES) -> List[float]:
     raise RuntimeError("Failed to embed after retries.")
 
 
-def generate_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> str:
-    """Generate a response via the Gemini generation API, retrying with exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            response = client_genai.models.generate_content(
-                model=GENERATION_MODEL,
-                contents=prompt
-            )
-            return response.text
-        except Exception:
-            logger.warning("Generation attempt %d/%d failed", attempt + 1, max_retries, exc_info=True)
-            time.sleep(2 ** attempt)
-    raise RuntimeError("Failed to generate after retries.")
+@st.cache_resource
+def get_gateways():
+    """One gateway for answers, one for HyDE drafts. Shared across sessions."""
+    answer_models = [GENERATION_MODEL] + [m for m in GENERATION_FALLBACKS if m != GENERATION_MODEL]
+    hyde_models = [HYDE_MODEL] + [m for m in HYDE_FALLBACKS if m != HYDE_MODEL]
+    exhausted = set()  # shared: a model that ran dry for HyDE is dry for answers too
+    answers = GeminiGateway(client_genai, answer_models, cache_path=ANSWER_CACHE_PATH, exhausted_today=exhausted)
+    hyde = GeminiGateway(
+        client_genai, hyde_models, exhausted_today=exhausted,
+        cache_path=ANSWER_CACHE_PATH.replace(".json", "_hyde.json") if ANSWER_CACHE_PATH else None,
+    )
+    return answers, hyde
+
+
+def generate_answer(prompt: str) -> str:
+    answers, _ = get_gateways()
+    return answers.generate(prompt, purpose="answer")
+
+
+def generate_hyde(prompt: str) -> str:
+    _, hyde = get_gateways()
+    return hyde.generate(prompt, purpose="hyde", max_output_tokens=200, temperature=0.7)
 
 
 class GeminiEmbeddingFunction(EmbeddingFunction):
     """Chroma embedding function backed by the Gemini embedding API."""
+
+    def __init__(self):
+        pass
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         embeddings = []
@@ -85,13 +112,23 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         return embeddings
 
 
-db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+@st.cache_resource
+def get_collection():
+    """Open the Chroma collection once per process.
 
-try:
-    collection = db_client.get_collection(
+    Streamlit reruns this script on every interaction. Creating a new
+    PersistentClient on each rerun races on the same SQLite file and causes
+    "Could not connect to tenant default_tenant".
+    """
+    db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    return db_client.get_collection(
         name=COLLECTION_NAME,
         embedding_function=GeminiEmbeddingFunction()
     )
+
+
+try:
+    collection = get_collection()
 except Exception:
     logger.exception("Could not open collection %r in %r", COLLECTION_NAME, CHROMA_DB_PATH)
     st.error(
@@ -101,10 +138,68 @@ except Exception:
     st.stop()
 
 
-def retrieve(query: str, k: int = DEFAULT_TOP_K) -> List[str]:
-    """Retrieve the top-k most relevant chunks for a query."""
-    results = collection.query(query_texts=[query], n_results=k)
-    return results["documents"][0]
+@st.cache_resource
+def load_production_rag():
+    """Initialize the production RAG pipeline (cached)."""
+    logger.info("Loading ProductionRAG pipeline...")
+
+    all_results = collection.get(include=["documents", "embeddings"])
+    chunks = all_results["documents"]
+    embeddings = all_results["embeddings"]
+
+    if not chunks or embeddings is None or len(chunks) != len(embeddings):
+        raise RuntimeError(
+            f"Index is empty or inconsistent: {len(chunks or [])} documents, "
+            f"{0 if embeddings is None else len(embeddings)} embeddings. Re-run ingest.py."
+        )
+
+    logger.info(f"Loaded {len(chunks)} chunks for production RAG")
+
+    rag = ProductionRAG(
+        chunks=chunks,
+        embeddings=embeddings,
+        embedding_model=EMBEDDING_MODEL,
+        generation_model=GENERATION_MODEL,
+        llm_client=client_genai,
+        reranker_model=RERANKER_MODEL,
+        hyde_generate_fn=generate_hyde,
+        use_hyde=USE_HYDE,
+    )
+
+    return rag
+
+
+rag_pipeline = load_production_rag()
+
+
+@st.cache_resource
+def get_query_condenser():
+    """Initialize query condenser (cached)."""
+    return QueryCondenser()
+
+
+def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None) -> tuple[List[str], Dict, str]:
+    """Retrieve using production RAG: HyDE + Hybrid + Rerank.
+
+    Supports multi-turn chat by condensing history with current query.
+
+    Returns:
+        (chunks, retrieval_stats, confidence_level)
+        confidence_level: "high" or "low"
+    """
+    # Condense query with chat history for multi-turn support
+    condenser = get_query_condenser()
+    if chat_history:
+        condensed_query = condenser.condense(chat_history, query)
+        logger.info(f"[Multi-turn] Condensed '{query[:50]}...' with history")
+    else:
+        condensed_query = query
+
+    # Use condensed query for retrieval
+    result = rag_pipeline.retrieve(condensed_query, top_k=k, verbose=False)
+    chunks = [r["chunk"] for r in result["final_chunks"]]
+    confidence = result.get("confidence", "high")
+    return chunks, result["retrieval_stats"], confidence
 
 
 def build_prompt(query: str, chunks: List[str]) -> str:
@@ -118,8 +213,9 @@ Do NOT use any outside knowledge, even if you recognize the company or topic.
 If specific details aren't in the context, explicitly say "the provided context doesn't cover this" rather than filling gaps from general knowledge.
 Cite which source number(s) you used in brackets after each claim, like [1] or [1][3].
 
-Context:
+<context>
 {numbered_context}
+</context>
 
 Question: {query}
 
@@ -128,155 +224,152 @@ Answer:"""
 
 
 def answer(query: str, k: int = DEFAULT_TOP_K) -> Dict:
-    """Answer a question end to end: retrieve, build prompt, generate."""
-    chunks = retrieve(query, k)
+    """Answer a question end to end: retrieve -> prompt -> generate.
+
+    If retrieval confidence is low, returns a graceful fallback message.
+    Handles multi-turn chat by using chat history for context.
+    """
+    # Get chat history (excluding current query)
+    chat_history = st.session_state.messages[:-1] if len(st.session_state.messages) > 1 else []
+
+    chunks, retrieval_stats, confidence = retrieve(query, k, chat_history=chat_history)
+
+    if confidence == "low":
+        return {
+            "answer": "I do not have sufficient internal documentation to answer this question with confidence. Please try:\n1. Rephrasing your question more specifically\n2. Checking if the information exists in the annual report\n3. Searching online for additional context",
+            "sources": [],
+            "retrieval_stats": retrieval_stats,
+            "confidence": "low",
+        }
+
     prompt = build_prompt(query, chunks)
-    answer_text = generate_with_retry(prompt)
-    return {"answer": answer_text, "sources": chunks}
+    try:
+        answer_text = generate_answer(prompt)
+    except QuotaExhaustedError as e:
+        logger.warning("%s", e)
+        return {
+            "answer": f"I couldn't write an answer right now. {e}. "
+                      "The sources I found are listed below. "
+                      "Quotas reset daily (https://ai.dev/rate-limit); "
+                      "run `python list_models.py` to see which models your key can use.",
+            "sources": chunks,
+            "retrieval_stats": retrieval_stats,
+            "confidence": confidence,
+        }
+    return {
+        "answer": answer_text,
+        "sources": chunks,
+        "retrieval_stats": retrieval_stats,
+        "confidence": "high",
+    }
 
 
-# --- Streamlit UI ---
+def format_source(chunk: str, max_chars: int = SOURCE_PREVIEW_CHARS) -> str:
+    """Format a source chunk for display."""
+    if len(chunk) > max_chars:
+        return chunk[:max_chars] + "..."
+    return chunk
 
-st.markdown("""
-<style>
-:root {
-    --bg: #0E1117;
-    --bg-secondary: #1A1D24;
-    --text: #E5E7EB;
-    --accent: #3B82F6;
-    --accent-soft: rgba(59, 130, 246, 0.12);
-    --border: rgba(255, 255, 255, 0.08);
-}
 
-.stApp {
-    background-color: var(--bg);
-    color: var(--text);
-}
+def _queue_question(question: str) -> None:
+    """Button callback: queue a sample question to be answered on this rerun."""
+    st.session_state.pending_query = question
 
-[data-testid="stChatMessage"] {
-    background-color: var(--bg-secondary);
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    padding: 0.4rem 0.2rem;
-    margin-bottom: 0.6rem;
-}
 
-.stButton button {
-    background-color: var(--bg-secondary);
-    color: var(--text);
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    text-align: left;
-    transition: all 0.15s ease;
-}
+def render_sample_questions(location) -> None:
+    """Render sample question buttons in the given container."""
+    for i, question in enumerate(SAMPLE_QUESTIONS):
+        location.button(
+            question,
+            key=f"sample_{location is st.sidebar}_{i}",
+            on_click=_queue_question,
+            args=(question,),
+            use_container_width=True,
+        )
 
-.stButton button:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background-color: var(--accent-soft);
-}
 
-[data-testid="stExpander"] {
-    background-color: var(--bg-secondary);
-    border-radius: 8px;
-    border: 1px solid var(--border);
-}
+def main():
+    """Main Streamlit app."""
+    st.set_page_config(page_title="BI Assistant", layout="wide")
+    st.title("Business Intelligence Assistant")
+    st.markdown("Ask questions about John Keells Holdings' 2025/26 Annual Report")
 
-[data-testid="stExpander"] summary {
-    color: var(--accent);
-    font-weight: 500;
-}
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-[data-testid="stChatInput"] {
-    background-color: var(--bg-secondary);
-}
+    if SAMPLE_QUESTIONS:
+        st.sidebar.subheader("Try asking")
+        render_sample_questions(st.sidebar)
 
-.citation-badge {
-    font-size: 0.72rem;
-    font-weight: 600;
-    background-color: var(--accent-soft);
-    color: var(--accent);
-    padding: 1px 7px;
-    border-radius: 4px;
-    margin-right: 4px;
-}
-</style>
-""", unsafe_allow_html=True)
+        # Empty state: show the samples in the main area until the first question.
+        if not st.session_state.messages and "pending_query" not in st.session_state:
+            st.markdown("**Not sure where to start? Try one of these:**")
+            cols = st.columns(2)
+            for i, question in enumerate(SAMPLE_QUESTIONS):
+                cols[i % 2].button(
+                    question,
+                    key=f"sample_main_{i}",
+                    on_click=_queue_question,
+                    args=(question,),
+                    use_container_width=True,
+                )
 
-st.title("Business Intelligence Assistant")
-st.caption("Ask questions about John Keells Holdings' Annual Report 2025/26")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if not st.session_state.messages:
-    st.write("Try an example question:")
-    example_questions = [
-        "What was the Group's EBITDA growth this year?",
-        "What are the biggest risks facing the company?",
-        "What is the outlook for Sri Lanka's tourism sector?",
-        "What is the Group's net debt to EBITDA ratio?",
-    ]
-    cols = st.columns(2)
-    for i, q in enumerate(example_questions):
-        with cols[i % 2]:
-            if st.button(q, use_container_width=True, key=f"example_{i}"):
-                st.session_state.messages.append({"role": "user", "content": q})
-                with st.spinner("Thinking..."):
-                    try:
-                        result = answer(q)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": result["answer"],
-                            "sources": result["sources"]
-                        })
-                    except Exception:
-                        logger.error("Failed to answer example question: %r", q, exc_info=True)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": "Sorry, I hit a temporary error reaching the AI service. Please try asking again.",
-                            "sources": []
-                        })
-                st.rerun()
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-        if message["role"] == "assistant" and message.get("sources"):
-            with st.expander("Sources"):
-                for i, source in enumerate(message["sources"]):
-                    st.markdown(
-                        f'<span class="citation-badge">{i+1}</span> {source[:SOURCE_PREVIEW_CHARS]}...',
-                        unsafe_allow_html=True
-                    )
-
-user_question = st.chat_input("Ask a question about the report...")
-
-if user_question:
-    st.session_state.messages.append({"role": "user", "content": user_question})
-    with st.chat_message("user"):
-        st.write(user_question)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                result = answer(user_question)
-                st.write(result["answer"])
-
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message.get("retrieval_stats"):
+                stats = message["retrieval_stats"]
+                confidence = message.get("confidence", "high")
+                confidence_color = "🟢" if confidence == "high" else "🔴"
+                st.caption(
+                    f"{confidence_color} Confidence: {confidence.upper()} | "
+                    f"Retrieval: {stats['method']} | "
+                    f"Candidates: {stats['num_candidates_evaluated']} | "
+                    f"Rerank: {stats['rerank_latency_ms']:.0f}ms"
+                )
+            if message.get("sources"):
                 with st.expander("Sources"):
-                    for i, source in enumerate(result["sources"]):
-                        st.markdown(
-                            f'<span class="citation-badge">{i+1}</span> {source[:SOURCE_PREVIEW_CHARS]}...',
-                            unsafe_allow_html=True
-                        )
+                    for i, source in enumerate(message["sources"], 1):
+                        st.markdown(f"**[{i}]** {format_source(source)}")
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": result["answer"],
-                    "sources": result["sources"]
-                })
-            except Exception:
-                logger.error("Failed to answer user question: %r", user_question, exc_info=True)
-                error_msg = "Sorry, I hit a temporary error reaching the AI service. Please try asking again."
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg, "sources": []})
+    typed_query = st.chat_input("Ask a question...")
+    query = typed_query or st.session_state.pop("pending_query", None)
+    if query:
+        st.session_state.messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                result = answer(query)
+                answer_text = result["answer"]
+                sources = result["sources"]
+                retrieval_stats = result["retrieval_stats"]
+                confidence = result.get("confidence", "high")
+
+            st.markdown(answer_text)
+
+            confidence_color = "🟢" if confidence == "high" else "🔴"
+            st.caption(
+                f"{confidence_color} Confidence: {confidence.upper()} | "
+                f"Retrieval: {retrieval_stats['method']} | "
+                f"Candidates: {retrieval_stats['num_candidates_evaluated']} | "
+                f"Rerank: {retrieval_stats['rerank_latency_ms']:.0f}ms"
+            )
+
+            if sources:
+                with st.expander("Sources"):
+                    for i, source in enumerate(sources, 1):
+                        st.markdown(f"**[{i}]** {format_source(source)}")
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer_text,
+                "sources": sources,
+                "retrieval_stats": retrieval_stats,
+                "confidence": confidence,
+            })
+
+
+if __name__ == "__main__":
+    main()

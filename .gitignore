@@ -24,3 +24,6 @@ data/*
 
 # Evaluation work in progress, not ready to publish yet
 evaluation/
+
+# Local answer cache
+.cache/
