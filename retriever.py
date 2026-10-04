@@ -41,8 +41,26 @@ STOPWORDS = frozenset(
 )
 
 
+def _stem(t: str) -> str:
+    """Light suffix stripping so word forms match: manage/management -> manag,
+    rooms -> room, increased/increases -> increas. Numbers are left alone."""
+    if len(t) <= 3 or t[0].isdigit():
+        return t
+    if t.endswith("ies") and len(t) > 4:
+        t = t[:-3] + "y"
+    elif t.endswith("s") and not t.endswith("ss"):
+        t = t[:-1]
+    for suffix in ("ment", "ing", "ed"):
+        if t.endswith(suffix) and len(t) - len(suffix) >= 4:
+            t = t[: -len(suffix)]
+            break
+    if t.endswith("e") and len(t) > 4:
+        t = t[:-1]
+    return t
+
+
 def tokenize(text: str) -> List[str]:
-    return [t for t in _TOKEN_RE.findall(text.lower()) if t not in STOPWORDS]
+    return [_stem(t) for t in _TOKEN_RE.findall(text.lower()) if t not in STOPWORDS]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +147,18 @@ class HybridRetriever:
         bm25_weight: float = 1.0,
         vector_weight: float = 1.0,
     ) -> Tuple[List[str], np.ndarray]:
+        top, scores = self.retrieve_ids(query_text, query_embedding, k, bm25_weight, vector_weight)
+        return [self.chunks[i] for i in top], scores
+
+    def retrieve_ids(
+        self,
+        query_text: str,
+        query_embedding,
+        k: int = 20,
+        bm25_weight: float = 1.0,
+        vector_weight: float = 1.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Same as retrieve() but returns chunk indices, so metadata can be attached."""
         n = len(self.chunks)
         fused = np.zeros(n, dtype=np.float64)
 
@@ -151,7 +181,7 @@ class HybridRetriever:
             logger.warning("Query embedding is zero or the wrong size; dense retrieval skipped.")
 
         top = np.argsort(-fused, kind="stable")[:k]
-        return [self.chunks[i] for i in top], fused[top]
+        return top, fused[top]
 
 
 # ---------------------------------------------------------------------------
@@ -167,22 +197,47 @@ class RerankerFilter:
             # which silently marked every answer as HIGH confidence.
             raise RuntimeError(f"Failed to load reranker {model_name}: {e}") from e
 
+    def _logits(self, pairs) -> np.ndarray:
+        """Raw relevance logits. The default sigmoid output saturates at 1.00,
+        so several passages tie at the top and the best one can be cut.
+        Ranking on logits keeps them apart; sigmoid is applied afterwards
+        only to produce the 0-1 confidence score."""
+        import torch
+
+        identity = torch.nn.Identity()
+        for kw in ("activation_fn", "activation_fct"):  # renamed across library versions
+            try:
+                return np.asarray(self.reranker.predict(pairs, **{kw: identity}), dtype=np.float64)
+            except TypeError:
+                continue
+        probs = np.clip(np.asarray(self.reranker.predict(pairs), dtype=np.float64), 1e-7, 1 - 1e-7)
+        return np.log(probs / (1 - probs))
+
+    def warm_up(self) -> None:
+        """First inference on GPU/MPS is slow; pay that cost at startup."""
+        try:
+            self._logits([["warm up", "warm up"]])
+        except Exception as e:
+            logger.warning(f"Reranker warm-up failed: {e}")
+
     def rerank(self, query: str, candidates: List[str], top_k: int = 3) -> Tuple[List[Dict], float]:
         if not candidates:
             return [], 0.0
         start = time.time()
         try:
-            scores = self.reranker.predict([[query, c] for c in candidates])
+            logits = self._logits([[query, c] for c in candidates])
+            probs = 1.0 / (1.0 + np.exp(-logits))
             latency = (time.time() - start) * 1000
-            order = np.argsort(scores)[::-1][:top_k]
+            order = np.argsort(-logits, kind="stable")[:top_k]
             return [
-                {"chunk": candidates[i], "rerank_score": float(scores[i]), "rank": j}
+                {"chunk": candidates[i], "rerank_score": float(probs[i]), "rerank_logit": float(logits[i]),
+                 "rank": j, "pos": int(i)}
                 for j, i in enumerate(order)
             ], latency
         except Exception as e:
             # Score 0.0, not 1.0: an unscored answer must land in the LOW tier.
             logger.error(f"Reranking failed: {e}. Marking results as unscored.")
-            return [{"chunk": c, "rerank_score": 0.0, "rank": i}
+            return [{"chunk": c, "rerank_score": 0.0, "rank": i, "pos": i}
                     for i, c in enumerate(candidates[:top_k])], 0.0
 
 
@@ -207,8 +262,24 @@ class ProductionRAG:
         rrf_k: int = 60,
         bm25_weight: float = 1.0,
         vector_weight: float = 1.0,
+        metadatas: Optional[List[Dict]] = None,
+        parents: Optional[Dict[str, Dict]] = None,
+        doc_task_type: Optional[str] = None,
+        query_task_type: Optional[str] = None,
     ):
+        """
+        metadatas: per-chunk dicts with "page" and "parent_id" (None for old indexes).
+        parents: parent_id -> {"page", "text"}; the answer model gets the parent.
+        doc_task_type / query_task_type: Gemini embedding task types. The index's
+            documents were embedded as doc_task_type; raw queries use
+            query_task_type and HyDE drafts (pseudo documents) use doc_task_type.
+            Leave both None for an index built without task types.
+        """
         self.llm_client = llm_client
+        self.metadatas = metadatas or [{} for _ in chunks]
+        self.parents = parents or {}
+        self.doc_task_type = doc_task_type
+        self.query_task_type = query_task_type
         self.embedding_model = embedding_model
         self.num_candidates = num_candidates
         self.bm25_weight = bm25_weight
@@ -218,12 +289,25 @@ class ProductionRAG:
         self.hyde = HyDETransformer(llm_client, generation_model, generate_fn=hyde_generate_fn, enabled=use_hyde)
         self.retriever = HybridRetriever(chunks, embeddings, rrf_k=rrf_k)
         self.reranker = RerankerFilter(reranker_model)
+        self.reranker.warm_up()
         self.tiers = ConfidenceTierRouter(high_threshold=high_threshold, low_threshold=low_threshold)
 
-    def _embed(self, text: str):
+    def _embed(self, text: str, task_type: Optional[str] = None):
+        config = types.EmbedContentConfig(task_type=task_type) if task_type else None
         return self.llm_client.models.embed_content(
-            model=self.embedding_model, contents=text
+            model=self.embedding_model, contents=text, config=config
         ).embeddings[0].values
+
+    def _attach_context(self, item: Dict, global_idx: int) -> Dict:
+        meta = self.metadatas[global_idx] or {}
+        parent = self.parents.get(meta.get("parent_id"))
+        item.update({
+            "index": int(global_idx),
+            "page": meta.get("page"),
+            "parent_id": meta.get("parent_id") or f"chunk_{global_idx}",
+            "context": parent["text"] if parent else item["chunk"],
+        })
+        return item
 
     def retrieve(self, query: str, top_k: int = 3, verbose: bool = False) -> Dict:
         # 1. Route
@@ -237,14 +321,17 @@ class ProductionRAG:
 
         # 3. Hybrid: BM25 always sees the real query, dense sees the HyDE draft
         start = time.time()
-        candidates, _ = self.retriever.retrieve(
-            query, self._embed(dense_text), k=self.num_candidates,
+        task = self.doc_task_type if hyde_used else self.query_task_type
+        cand_ids, _ = self.retriever.retrieve_ids(
+            query, self._embed(dense_text, task), k=self.num_candidates,
             bm25_weight=self.bm25_weight, vector_weight=self.vector_weight,
         )
+        candidates = [self.retriever.chunks[i] for i in cand_ids]
         hybrid_latency = (time.time() - start) * 1000
 
         # 4. Rerank against the real query
         reranked, rerank_latency = self.reranker.rerank(query, candidates, top_k=top_k)
+        reranked = [self._attach_context(r, cand_ids[r["pos"]]) for r in reranked]
 
         # 5. Confidence tier
         top_score = reranked[0]["rerank_score"] if reranked else 0.0

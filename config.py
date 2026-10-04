@@ -73,12 +73,24 @@ LOW_THRESHOLD = float(_cfg["retrieval"].get("low_threshold", 0.35))
 PDF_PATH = _cfg["data"]["pdf_path"]
 PAGE_RANGES = [tuple(r) for r in _cfg["data"]["page_ranges"]]
 
-CHUNK_SIZE = _cfg["chunking"]["size"]
-CHUNK_OVERLAP = _cfg["chunking"]["overlap"]
+CHILD_CHUNK_SIZE = _cfg["chunking"]["child_size"]
+CHILD_CHUNK_OVERLAP = _cfg["chunking"]["child_overlap"]
+PARENT_CHUNK_SIZE = _cfg["chunking"]["parent_size"]
+PARENT_CHUNK_OVERLAP = _cfg["chunking"]["parent_overlap"]
+# Old names kept for scripts that still import them.
+CHUNK_SIZE, CHUNK_OVERLAP = CHILD_CHUNK_SIZE, CHILD_CHUNK_OVERLAP
 
 MAX_RETRIES = _cfg["rate_limits"]["max_retries"]
 EMBED_RATE_LIMIT_DELAY_SECONDS = _cfg["rate_limits"]["embed_delay_seconds"]
 ANSWER_CACHE_PATH = _cfg["rate_limits"].get("answer_cache_path")
+REQUEST_TIMEOUT_SECONDS = int(_cfg["rate_limits"].get("request_timeout_seconds", 60))
+EMBED_BATCH_SIZE = int(_cfg["rate_limits"].get("embed_batch_size", 100))
+EMBEDDING_CACHE_PATH = _cfg["rate_limits"].get("embedding_cache_path", "./.cache/embeddings.sqlite")
+
+
+def parents_path(collection: str) -> str:
+    """Parent chunks live next to the Chroma files, one JSON file per collection."""
+    return str(Path(CHROMA_DB_PATH) / f"{collection}_parents.json")
 
 SOURCE_PREVIEW_CHARS = _cfg["ui"]["source_preview_chars"]
 SAMPLE_QUESTIONS = _cfg["ui"].get("sample_questions", [])

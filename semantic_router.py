@@ -9,6 +9,9 @@ Semantic Router: decide whether a query is worth a HyDE LLM call.
   so HyDE is skipped. This saves one LLM call per lookup.
 - Explanatory signals win over lookup signals: "Why did EBITDA rise 75%?"
   still runs HyDE.
+- Change questions ("How much did EBITDA grow?") run HyDE too: the report
+  says "increased by 75%", so keyword search ranks the answer 46th to 159th
+  of 968 chunks for "grow". Found with debug_retrieval.py.
 - Anything unclear defaults to running HyDE (quality over cost).
 """
 
@@ -25,6 +28,14 @@ _CONCEPTUAL = re.compile(
     r"impacts?|effects?|implications?|strateg\w*|approach|outlook|risks?|challenges?|"
     r"opportunit\w+|drivers?|overview|summari[sz]\w*|priorit\w+|plans?|vision|"
     r"how (?:does|did|do|is|are|will|has|have|can|could|should))\b",
+    re.IGNORECASE,
+)
+# Questions about change ("how much did EBITDA grow?") are where wording
+# mismatch bites: the report says "increased by 75%", never "grew". HyDE's
+# draft answer uses report-style wording, so these always run HyDE.
+_CHANGE = re.compile(
+    r"\b(grow|grew|grown|growth|rise|rose|risen|fall|fell|fallen|declin\w*|drop\w*|chang\w*|"
+    r"improv\w*|increas\w*|decreas\w*|perform\w*|trend\w*|compar\w*|vs\.?|versus)\b",
     re.IGNORECASE,
 )
 _LOOKUP_PHRASE = re.compile(r"\bhow (?:much|many)\b|\bwhat (?:is|was|were|are) the (?:total|number|amount|value)\b", re.IGNORECASE)
@@ -45,6 +56,8 @@ class SemanticRouter:
     def classify(self, query: str) -> Route:
         if _CONCEPTUAL.search(query):
             return self._log("run_hyde", "explanatory wording", query)
+        if _CHANGE.search(query):
+            return self._log("run_hyde", "change wording, vocabulary mismatch likely", query)
 
         lookup_signals = sum(bool(p.search(query)) for p in (_LOOKUP_PHRASE, _METRIC, _NUMBER, _ACRONYM))
         if lookup_signals >= 1:

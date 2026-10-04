@@ -22,12 +22,17 @@ models:
   reranker: BAAI/bge-reranker-base
 
 retrieval:
-  collection: jkh_annual_report_2025_26
+  # v2: full page coverage, page metadata, parent-child chunks.
+  # The old 150-chunk index is still stored as jkh_annual_report_2025_26.
+  collection: jkh_annual_report_2025_26_v2
   db_path: ./chroma_db
-  top_k: 6
+  # Passages sent to the answer model. 8, not 6: bge-reranker-base tends to
+  # rank industry-group EBITDA passages above the Group-level one, which
+  # debug_retrieval.py showed at rank 8.
+  top_k: 8
   use_hyde: true
   # Candidates fetched by hybrid search before reranking.
-  num_candidates: 20
+  num_candidates: 30
   # Reciprocal Rank Fusion: score = w / (rrf_k + rank). 60 is the standard constant.
   rrf_k: 60
   bm25_weight: 1.0
@@ -35,10 +40,14 @@ retrieval:
   # Confidence tiers on the top reranker score (0 to 1):
   #   >= high_threshold        HIGH: answer normally
   #   between the two          AMBIGUOUS: answer with a caution note
-  #   <  low_threshold         LOW: decline
-  # Provisional values; calibrate them against the evaluation set in Phase 5.
+  #   <  low_threshold         LOW: decline without calling the answer model
+  # The reranker's score is NOT a reliable answerability signal: an off-topic
+  # question (capital of France) scored 0.31 while a real one (hotel rooms,
+  # answer ranked 1st by retrieval) scored 0.29. So low_threshold only
+  # filters obvious junk; the answer model makes the final call and replies
+  # NOT_IN_REPORT when the passages do not contain the answer.
   high_threshold: 0.6
-  low_threshold: 0.35
+  low_threshold: 0.05
 
 data:
   pdf_path: ./data/Annual Report.pdf
@@ -47,10 +56,17 @@ data:
     - [138, 160]
 
 chunking:
-  size: 500
-  overlap: 50
+  # Children are embedded and searched; parents go to the answer model.
+  child_size: 500
+  child_overlap: 50
+  parent_size: 2000
+  parent_overlap: 200
 
 rate_limits:
+  # Per-request timeout for Gemini calls, in seconds.
+  request_timeout_seconds: 60
+  embed_batch_size: 100
+  embedding_cache_path: ./.cache/embeddings.sqlite
   answer_cache_path: ./.cache/answers.json
   max_retries: 5
   embed_delay_seconds: 0.1

@@ -1,131 +1,223 @@
 """
-One-time ingestion script that built this repo's chroma_db/ vector store.
+Build the vector index for John Keells Holdings' Annual Report 2025/26.
 
-Loads John Keells Holdings' Annual Report 2025/26 (pages 0-60 and 138-160,
-core narrative and outlook), chunks it with LangChain's
-RecursiveCharacterTextSplitter (500 characters, 50 overlap, chosen
-empirically), embeds each chunk via the Gemini embedding API, and stores
-the result in ChromaDB. app.py serves queries against the resulting store;
-it does not re-run this script.
+    python3 ingest.py --dry-run   # page and chunk counts, no API calls
+    python3 ingest.py             # embed and build the index
 
-Requires the source PDF locally as "Annual Report.pdf" (not committed to
-this repo due to its size) and GEMINI_API_KEY set in the environment.
-Resumable: re-running after a partial failure picks up from the last
-successfully stored batch.
+Pipeline
+1. Extract text page by page (page numbers are kept for citations).
+2. Parent-child chunking. Each page is split into parents (~2000 chars,
+   never crossing a page boundary), and each parent into children
+   (~500 chars). Children are embedded and searched for precision; the
+   answer model receives the parent for context.
+3. Embed children in batches of up to 100 texts per API request, with the
+   RETRIEVAL_DOCUMENT task type. Every vector is cached on disk, so a run
+   that stops on a quota error resumes for free.
+4. Build into "<collection>__building" and only swap it in once complete,
+   so a failed run never touches the live index.
+
+Previous version (kept in git history) embedded one chunk per request and
+had stopped after 150 of ~800 chunks, so the live index covered pages 1-16.
 """
 
+import argparse
+import json
+import logging
+import random
+import re
+import sys
 import time
-from google import genai
+from datetime import datetime, timezone
+from pathlib import Path
+
 import chromadb
-from chromadb import EmbeddingFunction
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 from config import (
+    CHILD_CHUNK_OVERLAP,
+    CHILD_CHUNK_SIZE,
     CHROMA_DB_PATH,
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
     COLLECTION_NAME,
-    EMBED_RATE_LIMIT_DELAY_SECONDS,
+    EMBED_BATCH_SIZE,
+    EMBEDDING_CACHE_PATH,
     EMBEDDING_MODEL,
-    MAX_RETRIES,
     PAGE_RANGES,
+    PARENT_CHUNK_OVERLAP,
+    PARENT_CHUNK_SIZE,
     PDF_PATH,
+    parents_path,
 )
+from embedding_cache import EmbeddingCache
 
-client_genai = genai.Client()
+DOC_TASK_TYPE = "RETRIEVAL_DOCUMENT"
 
-def get_embedding(text, max_retries=MAX_RETRIES):
-    for attempt in range(max_retries):
-        try:
-            result = client_genai.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=text
-            )
-            return result.embeddings[0].values
-        except Exception as e:
-            wait = 2 ** attempt
-            print(f"    Error: {type(e).__name__} - {e}")
-            print(f"    Retrying in {wait}s (attempt {attempt + 1}/{max_retries})...")
-            time.sleep(wait)
-    raise RuntimeError(f"Failed to embed after {max_retries} attempts.")
+# pypdf warns once per font that it could not fully decode without fontTools.
+# Text extraction still works, so keep the console readable.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-class GeminiEmbeddingFunction(EmbeddingFunction):
-    def __init__(self):
-        pass
 
-    def __call__(self, input):
-        embeddings = []
-        for text in input:
-            embeddings.append(get_embedding(text))
-            time.sleep(EMBED_RATE_LIMIT_DELAY_SECONDS)
-        return embeddings
+def clean(text: str) -> str:
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)  # re-join words hyphenated across lines
+    return re.sub(r"\s+", " ", text).strip()
 
-db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
-collection = db_client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    embedding_function=GeminiEmbeddingFunction()
-)
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP
-)
-
-def load_pdf(path, start_page=0, end_page=None):
+def load_pages(path: str):
     reader = PdfReader(path)
-    end_page = end_page or len(reader.pages)
-    full_text = ""
-    for page in reader.pages[start_page:end_page]:
-        text = page.extract_text()
-        if text:
-            full_text += text + "\n\n"
-    return full_text
+    pages, failed = [], []
+    for start, end in PAGE_RANGES:
+        for i in range(start, min(end, len(reader.pages))):
+            try:
+                text = clean(reader.pages[i].extract_text() or "")
+            except Exception as e:  # one corrupt page must not kill the run
+                failed.append((i + 1, str(e)[:80]))
+                continue
+            if len(text) >= 50:
+                pages.append({"page": i + 1, "text": text})  # 1-based PDF page number
+    return pages, failed, len(reader.pages)
 
-def chunk_text(text):
-    return splitter.split_text(text)
+
+def chunk(pages):
+    parent_split = RecursiveCharacterTextSplitter(chunk_size=PARENT_CHUNK_SIZE, chunk_overlap=PARENT_CHUNK_OVERLAP)
+    child_split = RecursiveCharacterTextSplitter(chunk_size=CHILD_CHUNK_SIZE, chunk_overlap=CHILD_CHUNK_OVERLAP)
+    parents, children = {}, []
+    for p in pages:
+        for pi, parent_text in enumerate(parent_split.split_text(p["text"])):
+            parent_id = f"p{p['page']:04d}_{pi:02d}"
+            parents[parent_id] = {"page": p["page"], "text": parent_text}
+            for ci, child_text in enumerate(child_split.split_text(parent_text)):
+                children.append({
+                    "id": f"{parent_id}_c{ci:02d}",
+                    "text": child_text,
+                    "metadata": {"page": p["page"], "parent_id": parent_id},
+                })
+    return parents, children
 
 
-def ingest(path, batch_size=50):
-    print(f"Loading PDF (page ranges: {PAGE_RANGES})...")
-    text = "".join(load_pdf(path, start_page=start, end_page=end) for start, end in PAGE_RANGES)
-    print(f"Loaded {len(text)} characters.")
+def _daily_quota(err) -> bool:
+    return "PerDay" in str(err) or "per day" in str(err).lower()
 
-    print("Chunking...")
-    chunks = chunk_text(text)
-    print(f"Created {len(chunks)} chunks.")
 
-    already_stored = collection.count()
-    print(f"Collection already has {already_stored} chunks stored (resuming from here).")
+def embed_all(children, cache: EmbeddingCache):
+    from google import genai
+    from google.genai import errors, types
 
-    total = len(chunks)
-    for batch_start in range(already_stored, total, batch_size):
-        batch_end = min(batch_start + batch_size, total)
-        batch_chunks = chunks[batch_start:batch_end]
-        batch_ids = [f"chunk_{i}" for i in range(batch_start, batch_end)]
+    keys = [EmbeddingCache.key(EMBEDDING_MODEL, DOC_TASK_TYPE, c["text"]) for c in children]
+    cached = cache.get_many(keys)
+    todo = [i for i, k in enumerate(keys) if k not in cached]
+    print(f"Embeddings: {len(cached)} cached, {len(todo)} to embed "
+          f"(~{-(-len(todo) // EMBED_BATCH_SIZE)} API requests).")
 
-        try:
-            collection.add(documents=batch_chunks, ids=batch_ids)
-            print(f"Saved batch: chunks {batch_start}-{batch_end - 1} ({collection.count()}/{total} total)")
-        except Exception as e:
-            print(f"BATCH FAILED at chunks {batch_start}-{batch_end - 1}: {e}")
-            print("Stopping here. Already-saved chunks are safe. Re-run the script to resume from this point.")
-            return
+    client = genai.Client()
+    config = types.EmbedContentConfig(task_type=DOC_TASK_TYPE)
+    for b in range(0, len(todo), EMBED_BATCH_SIZE):
+        batch = todo[b:b + EMBED_BATCH_SIZE]
+        for attempt in range(6):
+            try:
+                resp = client.models.embed_content(
+                    model=EMBEDDING_MODEL, contents=[children[i]["text"] for i in batch], config=config
+                )
+                break
+            except errors.ClientError as e:
+                if e.code == 429 and _daily_quota(e):
+                    print(f"\nDaily embedding quota reached after {b} of {len(todo)} new chunks.")
+                    print("Progress is cached. Re-run `python3 ingest.py` after the quota resets.")
+                    print("The live index was NOT changed.")
+                    sys.exit(2)
+                if e.code == 429 and attempt < 5:
+                    m = re.search(r"retry in ([\d.]+)s", str(e))
+                    wait = min(float(m.group(1)) if m else 2 ** attempt * 5, 90) + random.uniform(0, 2)
+                    print(f"  rate limited, waiting {wait:.0f}s ...")
+                    time.sleep(wait)
+                    continue
+                raise
+            except errors.ServerError:
+                if attempt < 5:
+                    time.sleep(2 ** attempt + random.uniform(0, 1))
+                    continue
+                raise
+        vectors = [e.values for e in resp.embeddings]
+        if len(vectors) != len(batch):
+            raise RuntimeError(f"API returned {len(vectors)} vectors for {len(batch)} texts")
+        new = {keys[i]: v for i, v in zip(batch, vectors)}
+        cache.put_many(new)
+        cached.update(new)
+        print(f"  embedded {min(b + EMBED_BATCH_SIZE, len(todo))}/{len(todo)}")
 
-    print("Ingestion complete.")
+    vectors = [cached[k] for k in keys]
+    dims = {len(v) for v in vectors}
+    if len(dims) != 1:
+        raise RuntimeError(f"Mixed embedding sizes {dims}; refusing to build a corrupt index.")
+    zero = sum(1 for v in vectors if not any(v))
+    if zero:
+        raise RuntimeError(f"{zero} zero vectors returned; refusing to build the index.")
+    return vectors
+
+
+def build_collection(children, vectors, parents, n_pages_total):
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    building = f"{COLLECTION_NAME}__building"
+    try:
+        client.delete_collection(building)
+    except Exception:
+        pass
+    col = client.create_collection(
+        name=building,
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_model": EMBEDDING_MODEL,
+            "doc_task_type": DOC_TASK_TYPE,
+            "child_chunk": f"{CHILD_CHUNK_SIZE}/{CHILD_CHUNK_OVERLAP}",
+            "parent_chunk": f"{PARENT_CHUNK_SIZE}/{PARENT_CHUNK_OVERLAP}",
+            "page_ranges": json.dumps(PAGE_RANGES),
+            "built_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    for i in range(0, len(children), 500):
+        part = children[i:i + 500]
+        col.add(
+            ids=[c["id"] for c in part],
+            documents=[c["text"] for c in part],
+            metadatas=[c["metadata"] for c in part],
+            embeddings=vectors[i:i + 500],
+        )
+    if col.count() != len(children):
+        raise RuntimeError(f"Stored {col.count()} of {len(children)} chunks; live index left unchanged.")
+
+    # Parents first, then the atomic-enough swap of the collection name.
+    path = Path(parents_path(COLLECTION_NAME))
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(parents), encoding="utf-8")
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    col.modify(name=COLLECTION_NAME)
+    tmp.replace(path)
+    print(f"\nIndex '{COLLECTION_NAME}' built: {len(children)} chunks, {len(parents)} parents.")
 
 
 def main():
-    ingest(PDF_PATH)
-    print("Final documents in collection:", collection.count())
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="show page and chunk counts, no API calls")
+    args = ap.parse_args()
 
-    results = collection.query(
-        query_texts=["What are the biggest risks facing the company?"],
-        n_results=3
-    )
-    for i, doc in enumerate(results["documents"][0]):
-        print(f"{i+1}. {doc[:150]}...")
+    pages, failed, total = load_pages(PDF_PATH)
+    parents, children = chunk(pages)
+    print(f"PDF: {total} pages. Page ranges {PAGE_RANGES}: {len(pages)} pages with text.")
+    if failed:
+        print(f"Skipped {len(failed)} unreadable pages: {failed[:5]}")
+    print(f"Chunks: {len(parents)} parents, {len(children)} children "
+          f"({sum(len(c['text']) for c in children):,} chars).")
+    if args.dry_run:
+        cache = EmbeddingCache(EMBEDDING_CACHE_PATH)
+        keys = [EmbeddingCache.key(EMBEDDING_MODEL, DOC_TASK_TYPE, c["text"]) for c in children]
+        todo = len(keys) - len(cache.get_many(keys))
+        print(f"Dry run: {todo} chunks need embedding (~{-(-todo // EMBED_BATCH_SIZE)} API requests). Nothing changed.")
+        return
+
+    vectors = embed_all(children, EmbeddingCache(EMBEDDING_CACHE_PATH))
+    build_collection(children, vectors, parents, total)
 
 
 if __name__ == "__main__":

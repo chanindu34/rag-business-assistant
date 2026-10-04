@@ -49,6 +49,7 @@ class GeminiGateway:
         max_transient_retries: int = 2,
         cache_path: Optional[str] = None,
         exhausted_today: Optional[set] = None,
+        never_cache: Optional[set] = None,
     ):
         self.client = client
         self.models = models
@@ -56,6 +57,9 @@ class GeminiGateway:
         # Pass the same set to several gateways so they share what is exhausted.
         self.exhausted_today = exhausted_today if exhausted_today is not None else set()
         self.missing_models = set()
+        # Responses that should be retried next time rather than replayed,
+        # e.g. a refusal that may have been caused by weak retrieval.
+        self.never_cache = never_cache or set()
         self.cache_path = Path(cache_path) if cache_path else None
         self._cache = self._load_cache()
         self._lock = threading.Lock()
@@ -149,10 +153,100 @@ class GeminiGateway:
                     self.missing_models.add(model)
                     return None
                 raise  # other 4xx: retrying will not help
-            except errors.ServerError:
-                if attempt < self.max_transient_retries:
-                    time.sleep(2 ** attempt + random.uniform(0, 1))
+            except errors.ServerError as e:
+                # 503 "overloaded" rarely clears within seconds. One quick
+                # retry, then fail over: another model is faster than waiting.
+                if attempt == 0:
+                    time.sleep(0.5 + random.uniform(0, 0.5))
                     continue
-                logger.warning("[LLM] %s server errors, trying next model", model)
+                logger.warning("[LLM] %s server error %s, trying next model", model, e.code)
                 return None
         return None
+
+    # ---------- streaming ----------
+    def stream(self, prompt: str, purpose: str = "answer"):
+        """Yield the answer in pieces as the model writes it.
+
+        Failover happens only before the first piece arrives: once text is on
+        screen, switching models mid-answer would produce a stitched answer.
+        The full text is cached at the end, so a repeat question streams from
+        the cache instantly.
+        """
+        key = self._key(prompt, purpose)
+        if key in self._cache:
+            logger.info("[LLM] cache hit (%s)", purpose)
+            yield self._cache[key]
+            return
+
+        config = types.GenerateContentConfig(
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        for model in self.models:
+            if model in self.exhausted_today:
+                continue
+            for attempt in range(2):
+                try:
+                    it = self.client.models.generate_content_stream(model=model, contents=prompt, config=config)
+                    first = next(it, None)  # errors surface here, before anything is shown
+                    break
+                except errors.ClientError as e:
+                    if e.code == 429 and _is_daily_quota(e):
+                        logger.warning("[LLM] %s daily quota exhausted, trying next model", model)
+                        self.exhausted_today.add(model)
+                    elif e.code == 404:
+                        logger.error("[LLM] model %s not found on this key, skipping it", model)
+                        self.exhausted_today.add(model)
+                        self.missing_models.add(model)
+                    elif e.code == 429 and attempt == 0:
+                        delay = _suggested_delay_seconds(e) or 1
+                        if delay <= 10:
+                            time.sleep(delay + random.uniform(0, 0.5))
+                            continue
+                    else:
+                        raise
+                    it = None
+                    break
+                except errors.ServerError as e:
+                    if attempt == 0:
+                        time.sleep(0.5 + random.uniform(0, 0.5))
+                        continue
+                    logger.warning("[LLM] %s server error %s, trying next model", model, e.code)
+                    it = None
+                    break
+            else:
+                it = None
+            if it is None:
+                continue
+
+            logger.info("[LLM] %s streaming via %s", purpose, model)
+            parts = []
+            for chunk in ([first] if first is not None else []):
+                if chunk.text:
+                    parts.append(chunk.text)
+                    yield chunk.text
+            try:
+                for chunk in it:
+                    if chunk.text:
+                        parts.append(chunk.text)
+                        yield chunk.text
+            except Exception as e:  # connection dropped mid-answer: keep what we have
+                logger.warning("[LLM] stream from %s interrupted: %s", model, e)
+                parts.append("\n\n_(Answer interrupted by a network error.)_")
+                yield parts[-1]
+                return
+            text = "".join(parts).strip()
+            if text and text not in self.never_cache:
+                with self._lock:
+                    self._cache[key] = text
+                    self._save_cache()
+            return
+
+        missing = [m for m in self.models if m in self.missing_models]
+        dry = [m for m in self.models if m not in self.missing_models]
+        parts = []
+        if dry:
+            parts.append("out of quota or unavailable today: " + ", ".join(dry))
+        if missing:
+            parts.append("not available on this API key: " + ", ".join(missing))
+        raise QuotaExhaustedError("No Gemini model could answer. " + "; ".join(parts))
+
