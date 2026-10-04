@@ -1,119 +1,133 @@
 # Business Intelligence Assistant
 
-A retrieval-augmented generation (RAG) system that answers natural-language questions about John Keells Holdings' Annual Report 2025/26, with source citations for every claim.
+A retrieval-augmented generation (RAG) system that answers questions about John Keells Holdings' Annual Report 2025/26, citing the page each claim comes from.
 
 **Live demo:** https://rag-business-assistant-pdpsjsuaxzvmaaff8edv3b.streamlit.app
 
 ## What it does
 
-A chat interface over a real 612-page annual report. Ask a question, get an answer synthesized from the actual document, not a general-knowledge guess, with numbered citations you can click to verify against the exact source text.
+Ask a question in plain English. The app finds the relevant passages in the report, writes an answer using only those passages, cites them as [1], [2] with page numbers, and tells you how confident it is. If the report does not contain the answer, it says so instead of guessing.
 
 ## Architecture
 
 ```
-PDF → chunk (500 chars, 50 overlap) → embed (Gemini) → store (ChromaDB)
-                                                              ↓
-query → embed → retrieve top-k → build cited prompt → generate answer
+Question
+  -> Follow-up resolution     "Why did it grow?" becomes "How much did EBITDA grow? Why did it grow?"
+  -> Semantic router          fact lookup: skip HyDE | explanation or change question: run HyDE
+  -> HyDE (optional)          draft a hypothetical answer, embed the draft
+  -> Hybrid search            BM25 (stemmed keywords) + dense (cosine), fused with Reciprocal Rank Fusion
+  -> Cross-encoder rerank     30 candidates scored, top 8 kept
+  -> Parent expansion         each matched 500-char passage is swapped for its 2,000-char parent
+  -> Confidence tier          high | moderate (answer with a caution note) | junk filtered before the LLM
+  -> Grounded generation      answer from context only, cited, streamed; NOT_IN_REPORT when unanswerable
 ```
 
-- **Embeddings:** Gemini `gemini-embedding-001`, via a custom adapter class decoupling the vector store from any one provider
-- **Vector store:** ChromaDB, persistent, with resumable batch ingestion (survives API failures mid-run without losing progress)
-- **Generation:** Gemini `gemini-2.5-flash`, with exponential-backoff retry logic on both embedding and generation calls
-- **Chunking:** LangChain's RecursiveCharacterTextSplitter. Chunk size chosen empirically (tested at 200/500/1000 chars; 500 was the only size that avoided both mid-sentence cuts and loss of retrieval precision)
-- **Document scope:** deliberately limited to pages 0-60 and 138-160 (core financial/strategic narrative + outlook). Two reasons: pages 166-293 repeat Group-level facts at finer industry-group granularity, and the regulatory disclosure sections (294+) are structurally tabular (Topic, Metric Code, Unit of Measure). Standard text extraction flattens tables into disconnected values, losing the relational structure that gives a table its meaning. Scoping to narrative-heavy sections also kept ingestion within the embedding API's daily free-tier quota.
+| Component | Choice | Why |
+|---|---|---|
+| Embeddings | Gemini `gemini-embedding-001`, 3072 dims, `RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY` task types | HyDE drafts are embedded as documents, raw questions as queries |
+| Sparse search | BM25 over a tokenizer that lowercases, strips punctuation and lightly stems | "manage" matches "management", "EBITDA?" matches "EBITDA" |
+| Fusion | Weighted Reciprocal Rank Fusion, k = 60 | Ranks, not raw scores, so BM25 and cosine never need normalising |
+| Reranker | `BAAI/bge-reranker-base` locally; `ms-marco-MiniLM-L-6-v2` on Streamlit Cloud | Ranked on raw logits; the default sigmoid output saturates at 1.00 and ties |
+| Generation | Gemini flash models with an ordered fallback chain | Each model has its own free-tier quota; 503s and exhausted quotas fail over in under a second |
+| Vector store | ChromaDB (persistent), brute-force cosine in NumPy | ~1,000 vectors does not need an ANN index |
+| UI | Streamlit with live pipeline status, streaming answers and page-tagged sources | |
 
-## Testing results
+### Ingestion
 
-10 real questions, manually graded against the actual source text (not assumed correct):
+- Text is extracted page by page so every chunk knows its page.
+- Parent-child chunking: each page splits into parents (~2,000 chars, never crossing a page), each parent into children (~500 chars). Children are searched; the answer model receives parents.
+- Embeddings are requested in batches of 100 and cached on disk by (model, task type, text). A run that stops on a quota error resumes for free, and rebuilding an unchanged index costs zero API calls.
+- The index is built under a temporary name and swapped in only when complete, so a failed run never breaks the live index.
 
-- **9/10 answered correctly**, including hard synthesis questions with zero keyword overlap with the source phrasing
-- **3/10 correct but repetitive**: multiple retrieved chunks restating the same point in slightly different words
-- **1/10 contained a confirmed hallucination**: cited a specific initiative name that was verifiably absent from all retrieved context
+### Scope
 
-### The hallucination, and what I learned from it
+Pages 1 to 60 (overview, Chairperson's message, management discussion, Group financial review) and 139 to 160 (outlook and risks, share information): 82 of 612 pages, 968 searchable passages. The industry group deep dives and the financial statements are excluded: the statements are mostly tables, and plain text extraction flattens a table into disconnected numbers.
 
-Asked about ESG initiatives, the model referenced a specific program by name that wasn't present in any of the 6 retrieved chunks, confirmed via direct string search, not assumption. I tried two fixes:
+## Resilience
 
-1. **Explicit prompt instruction** forbidding outside knowledge, even when the model recognizes the company. Did not resolve it on retest.
-2. **A regex-based faithfulness check** flagging capitalized terms absent from retrieved context. Produced false positives on ordinary capitalized words while still missing the actual hallucinated term.
+- **Quota and outages:** answer and HyDE calls walk an ordered model chain. A daily quota error is never retried; a 503 gets one quick retry, then the next model. Every Gemini call has a 60 second timeout.
+- **Embedding API down:** retrieval falls back to keyword search only, and the answer is labelled accordingly.
+- **Repeat questions** are served from a disk cache with no API call. Refusals are not cached, so a retry gets a fresh attempt.
+- **Input limits:** empty input is ignored; questions over 500 characters are rejected before any API call.
 
-**Conclusion:** this is a known, real limitation of prompt-only grounding. LLMs can surface training-data knowledge about well-known public entities regardless of instructions. A production fix would need semantic-level faithfulness verification (comparing claim embeddings against source embeddings), not prompt engineering or string matching. I removed the unreliable regex check from the live app rather than ship something that produces misleading signals, documenting the finding here instead.
+## What testing found
 
-### Known limitation: no multi-turn memory
+These came from testing the system on real questions, using `debug_retrieval.py` to trace where the correct passage ranks at each stage (BM25, dense, fused, reranked).
 
-Each question is answered independently, retrieval and generation don't incorporate prior conversation turns. Follow-up questions using pronouns or references ("that one", "the other option") can't be resolved, and the system correctly says so rather than guessing. A production version would need to include recent conversation history in the retrieval/generation context.
+1. **The original index covered 16 pages, not 82.** The first ingestion embedded one chunk per API request and stopped on a quota error after 150 of 820 chunks. The app had only ever searched pages 1 to 16. Rebuilding with batched, cached embeddings took 10 requests.
+2. **Vocabulary mismatch.** "How much did Group EBITDA grow?" failed because the report says "increased by 75%", never "grew". BM25 ranked the six passages containing the answer between 46th and 159th. The router had skipped HyDE because it saw a metric and a year, so questions about change now always run HyDE.
+3. **Stemming.** For "How many hotel rooms does the Group manage?", the correct passage went from BM25 rank 16 to rank 1 once "manage" could match "management".
+4. **Reranker scores do not measure answerability.** An off-topic question ("What is the capital of France?") scored 0.31, higher than a real one whose answer retrieval ranked first (0.29). No single threshold separates them. The reranker now only orders passages and filters obvious junk; the answer model decides whether the passages contain the answer and replies `NOT_IN_REPORT` if not.
+5. **Parent context rescued a weak reranker.** For the EBITDA question the reranker placed the Group level passage 8th, below several industry group passages. A neighbouring child in the same parent made the top 6, so the model still received the answer. Sending 8 passages instead of 6 covers this case; a stronger reranker is the proper fix.
+6. **The report contradicts itself.** Page 10 gives 3,468 rooms under management "as at 31 March 2026"; page 36 gives 3,577 with no date. The assistant reports both, with citations, rather than picking one.
+7. **Prompt-only grounding has a limit.** An earlier version named an ESG initiative that appeared in none of the retrieved passages. Instructions alone did not stop it, which is why the system now has an explicit refusal path and why claim-level faithfulness checking is on the list below.
+
+## Known limitations
+
+- **Coverage:** 82 of 612 pages. Tables are flattened, so questions about the financial statements will be declined.
+- **Reranker:** `bge-reranker-base` tends to rank industry group figures above Group level ones. `BAAI/bge-reranker-v2-m3` should do better but is twice the size; it is a one-line change in `config.yaml` and measurable with `debug_retrieval.py`.
+- **Confidence thresholds** (0.6 and 0.05) are set from a handful of observed cases, not yet calibrated on a labelled evaluation set.
+- **Follow-up detection** is a rule-based heuristic. An LLM rewrite would handle more phrasings at the cost of one API call per follow-up.
+- **Not multi-tenant:** no authentication, one Streamlit process, local Chroma files. Fine for a demo, not for production traffic.
 
 ## Tech stack
 
-Python, Google Gemini API, ChromaDB, LangChain (text splitting), Streamlit, Docker
+Python, Google Gemini API, ChromaDB, rank-bm25, sentence-transformers (cross-encoder), LangChain text splitters, pypdf, Streamlit, Docker
 
 ## Project structure
 
 ```
-app.py            Streamlit chat app (retrieval, prompt building, generation)
-ingest.py         One-time script that builds the vector store
-config.py         Loads config.yaml and exposes settings to every script
-config.yaml       Models, retrieval, chunking and rate limit settings
-chroma_db/        Persistent ChromaDB vector store (committed)
-data/             Source PDF goes here (not committed)
-.env.example      Template for API keys
+app.py                 Streamlit UI: chat, live pipeline status, streaming, sources
+retriever.py           Router, HyDE, hybrid search with RRF, reranker, confidence tiers
+semantic_router.py     Decides when HyDE is worth an LLM call
+query_condensation.py  Resolves follow-up questions without an API call
+confidence_tiers.py    High / moderate / low tiers on the reranker score
+llm.py                 Gemini gateway: model fallback, quota handling, streaming, answer cache
+ingest.py              Builds the index: page extraction, parent-child chunks, batched cached embeddings
+embedding_cache.py     On-disk embedding cache
+debug_retrieval.py     Shows where the correct passage ranks at every stage
+list_models.py         Lists the Gemini models your API key can use
+config.yaml            Every tunable setting, with the reasoning behind non-obvious values
+chroma_db/             Prebuilt index (committed)
+experimental/          Earlier modules not used by the app, with notes on why
 ```
-
-## Configuration
-
-All tunable settings live in one place, `config.yaml`: model names, collection
-name, top-k, chunk size and overlap, page ranges, retry and rate limit values.
-Every script reads them through `config.py`, so the embedding model used to
-build the index cannot drift from the one used to query it.
-
-Any value can be overridden with an environment variable named
-`RAG_<SECTION>_<KEY>`, for example `RAG_RETRIEVAL_TOP_K=8`. Secrets (API keys)
-are never stored in `config.yaml`; they stay in `.env` or in the hosting
-platform's secrets.
 
 ## Run it locally
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then put your real GEMINI_API_KEY in .env
-export GEMINI_API_KEY="your-key-here"
+cp .env.example .env          # add your GEMINI_API_KEY
 streamlit run app.py
 ```
 
-Or with Docker:
+The first start downloads the reranker (about 1.1 GB). After that, setting `HF_HUB_OFFLINE=1` in `.env` skips the update check, which helps on networks that block Hugging Face.
+
+Run `python3 list_models.py` to see which Gemini models your key can use, and edit the model chain in `config.yaml` to match.
+
+### Docker
 
 ```bash
 docker build -t rag-assistant .
 docker run -p 8501:8501 --env-file .env rag-assistant
 ```
 
-## Rebuilding the vector store
+The image uses CPU-only PyTorch, bakes the reranker in at build time and runs as a non-root user with a health check on Streamlit's `/_stcore/health`. For a smaller image: `--build-arg RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2`.
 
-`ingest.py` is the one-time script that chunked the source annual report with
-LangChain's RecursiveCharacterTextSplitter and built the committed `chroma_db/`
-store. It is not part of the running app and does not need to be re-run to use
-the assistant. To re-run it:
+### Rebuilding the index
 
-1. Download the John Keells Holdings Annual Report 2025/26 PDF from the
-   company's investor relations page.
-2. Save it as `data/Annual Report.pdf` (the path is set by `data.pdf_path` in
-   `config.yaml`; the PDF is not committed due to its size).
-3. Run:
+1. Save the annual report PDF as `data/Annual Report.pdf` (not committed because of its size).
+2. Run:
 
 ```bash
 pip install -r requirements-ingest.txt
-export GEMINI_API_KEY="your-key-here"
-python ingest.py
+python3 ingest.py --dry-run     # page and chunk counts, no API calls
+python3 ingest.py               # about 10 embedding requests
 ```
-
-Ingestion is resumable: if it stops partway, re-running continues from the last
-stored batch. If you change the embedding model or chunking settings, delete
-`chroma_db/` first so the whole index is rebuilt consistently.
 
 ## What I'd build next
 
-- **Layout-aware document parsing** (e.g. LlamaParse) to properly handle the tabular sections that are currently excluded, preserving table structure as Markdown instead of dropping them entirely
-- **Semantic faithfulness verification** to reliably catch the hallucination class found above, replacing the abandoned regex-based attempt
-- **Conversation memory** so follow-up questions can reference prior turns
-- **Re-ranking step** to reduce the repetition observed in 3/10 test answers
-- **Expanded document scope** once ingestion can run across multiple days without hitting free-tier quota limits
+- **An evaluation set** of questions with answers and page numbers taken from the report, to calibrate the confidence thresholds and catch regressions in CI.
+- **Claim-level faithfulness checking:** verify each cited sentence against its source passage before showing the answer.
+- **Layout-aware parsing** (for example LlamaParse or Docling) to bring the financial statement tables in with their structure intact.
+- **A stronger reranker**, evaluated against the current one with `debug_retrieval.py`.

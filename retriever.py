@@ -335,17 +335,26 @@ class ProductionRAG:
         })
         return item
 
-    def retrieve(self, query: str, top_k: int = 3, verbose: bool = False) -> Dict:
+    def retrieve(self, query: str, top_k: int = 3, verbose: bool = False, on_step=None) -> Dict:
+        """on_step(message) is called as each stage starts, so a UI can show progress."""
+        step = on_step or (lambda message: None)
+
         # 1. Route
         route = self.router.classify(query) if self.hyde.enabled else "hyde_disabled"
 
         # 2. HyDE (only when routed to it)
         start = time.time()
-        dense_text = self.hyde.generate_hypothetical_answer(query) if route == "run_hyde" else query
+        if route == "run_hyde":
+            step("Drafting a hypothetical answer to search with (HyDE)")
+            dense_text = self.hyde.generate_hypothetical_answer(query)
+        else:
+            step("Fact lookup detected, skipping HyDE")
+            dense_text = query
         hyde_used = dense_text != query
         hyde_latency = (time.time() - start) * 1000
 
         # 3. Hybrid: BM25 always sees the real query, dense sees the HyDE draft
+        step(f"Searching {len(self.retriever.chunks):,} passages with keyword and semantic search")
         start = time.time()
         task = self.doc_task_type if hyde_used else self.query_task_type
         # Graceful degradation: if the embedding API is down or out of quota,
@@ -364,6 +373,7 @@ class ProductionRAG:
         hybrid_latency = (time.time() - start) * 1000
 
         # 4. Rerank against the real query
+        step(f"Reranking the top {len(candidates)} candidates")
         reranked, rerank_latency = self.reranker.rerank(query, candidates, top_k=top_k)
         reranked = [self._attach_context(r, cand_ids[r["pos"]]) for r in reranked]
 

@@ -242,14 +242,16 @@ def get_query_condenser():
     return QueryCondenser()
 
 
-def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None) -> Dict:
+def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None, on_step=None) -> Dict:
     """Run the retrieval pipeline, resolving follow-up questions first.
 
     Returns a dict with chunks, retrieval_stats, confidence
     ("high" | "ambiguous" | "low") and previous_question (or None).
     """
     condensed_query, previous_question = get_query_condenser().resolve(chat_history or [], query)
-    result = rag_pipeline.retrieve(condensed_query, top_k=k)
+    if previous_question and on_step:
+        on_step("Follow-up question, adding context from the previous question")
+    result = rag_pipeline.retrieve(condensed_query, top_k=k, on_step=on_step)
     stats = result["retrieval_stats"]
     stats["follow_up"] = previous_question is not None
     sources, seen = [], set()
@@ -311,10 +313,10 @@ AMBIGUOUS_NOTE = (
 )
 
 
-def answer(query: str, k: int = DEFAULT_TOP_K) -> Dict:
+def answer(query: str, k: int = DEFAULT_TOP_K, on_step=None) -> Dict:
     """Answer a question end to end: resolve follow-up, retrieve, tier, generate."""
     chat_history = st.session_state.messages[:-1] if len(st.session_state.messages) > 1 else []
-    r = retrieve(query, k, chat_history=chat_history)
+    r = retrieve(query, k, chat_history=chat_history, on_step=on_step)
     # Remember the resolved form on the user message so later follow-ups chain.
     st.session_state.messages[-1]["resolved_query"] = r["resolved_query"]
     chunks, stats, confidence = r["chunks"], r["retrieval_stats"], r["confidence"]
@@ -364,32 +366,47 @@ def _answer_stream(prompt: str, confidence: str, state: Dict):
         yield AMBIGUOUS_NOTE
 
 
-TIER_ICON = {"high": "🟢", "ambiguous": "🟡", "low": "🔴"}
+TIER_BADGE = {
+    "high": ("green", "High confidence"),
+    "ambiguous": ("orange", "Moderate confidence"),
+    "low": ("red", "Not found in report"),
+}
 
 
-def render_stats_caption(stats: Dict, confidence: str) -> None:
-    """One-line retrieval summary under each answer."""
-    parts = [
-        f"{TIER_ICON.get(confidence, '⚪')} Confidence: {confidence.upper()}"
-        + (f" ({stats['top_score']:.2f})" if "top_score" in stats and not stats.get("declined_by_model") else ""),
-        f"Retrieval: {stats.get('method', '?')}",
-    ]
-    if stats.get("route") == "skip_hyde":
-        parts.append("Fact lookup, HyDE skipped")
+def render_answer_meta(stats: Dict, confidence: str) -> None:
+    """Badges under each answer: confidence, retrieval path, timing."""
+    color, label = TIER_BADGE.get(confidence, ("gray", confidence.title()))
+    if "top_score" in stats and not stats.get("declined_by_model"):
+        label += f" · {stats['top_score']:.2f}"
+    badges = [f":{color}-badge[{label}]"]
+    if stats.get("dense_unavailable"):
+        badges.append(":orange-badge[Keyword search only]")
+    elif stats.get("hyde_used"):
+        badges.append(":blue-badge[HyDE]")
+    elif stats.get("route") == "skip_hyde":
+        badges.append(":blue-badge[Fact lookup, HyDE skipped]")
     if stats.get("follow_up"):
-        parts.append("Follow-up resolved")
-    if stats.get("declined_by_model"):
-        parts.append("Model found no answer in the passages")
-    parts.append(f"Candidates: {stats.get('num_candidates_evaluated', '?')}")
-    parts.append(f"Rerank: {stats.get('rerank_latency_ms', 0):.0f}ms")
-    st.caption(" | ".join(parts))
+        badges.append(":violet-badge[Follow-up resolved]")
+    if stats.get("total_ms"):
+        badges.append(f":gray-badge[{stats['total_ms'] / 1000:.1f}s]")
+    st.markdown(" ".join(badges))
 
 
-def format_source(source, max_chars: int = SOURCE_PREVIEW_CHARS) -> str:
+def render_sources(sources: List) -> None:
+    if not sources:
+        return
+    with st.expander(f"Sources ({len(sources)})"):
+        for i, source in enumerate(sources, 1):
+            page = source.get("page") if isinstance(source, dict) else None
+            tag = f":gray-badge[Page {page}]" if page else ""
+            st.markdown(f"**[{i}]** {tag}  \n{format_source(source, with_page=False)}")
+
+
+def format_source(source, max_chars: int = SOURCE_PREVIEW_CHARS, with_page: bool = True) -> str:
     """One source line: page number plus the passage that matched the question."""
     if isinstance(source, dict):
         text = source.get("match") or source.get("text", "")
-        page = f"*Page {source['page']}* · " if source.get("page") else ""
+        page = f"*Page {source['page']}* · " if with_page and source.get("page") else ""
     else:  # messages saved before page metadata existed
         text, page = source, ""
     if len(text) > max_chars:
@@ -402,96 +419,102 @@ def _queue_question(question: str) -> None:
     st.session_state.pending_query = question
 
 
-def render_sample_questions(location) -> None:
-    """Render sample question buttons in the given container."""
-    for i, question in enumerate(SAMPLE_QUESTIONS):
-        location.button(
-            question,
-            key=f"sample_{location is st.sidebar}_{i}",
-            on_click=_queue_question,
-            args=(question,),
-            use_container_width=True,
-        )
+def _new_chat() -> None:
+    st.session_state.messages = []
+
+
+def render_assistant_message(message: Dict) -> None:
+    st.markdown(message["content"])
+    if message.get("retrieval_stats"):
+        render_answer_meta(message["retrieval_stats"], message.get("confidence", "high"))
+    render_sources(message.get("sources"))
 
 
 def main():
     """Main Streamlit app."""
-    st.set_page_config(page_title="BI Assistant", layout="wide")
-    st.title("Business Intelligence Assistant")
-    st.markdown("Ask questions about John Keells Holdings' 2025/26 Annual Report")
+    st.set_page_config(page_title="BI Assistant", layout="centered", initial_sidebar_state="collapsed")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    if SAMPLE_QUESTIONS:
-        st.sidebar.subheader("Try asking")
-        render_sample_questions(st.sidebar)
+    st.markdown(
+        "<h1 style='text-align: center; margin-bottom: 0;'>Business Intelligence Assistant</h1>"
+        "<p style='text-align: center; color: gray; font-size: 1.1rem; margin-top: 0;'>"
+        "for John Keells Holdings</p>",
+        unsafe_allow_html=True,  # static text only, no user input
+    )
+    if st.session_state.messages:
+        _, action = st.columns([5, 1])
+        action.button("New chat", on_click=_new_chat, use_container_width=True)
 
-        # Empty state: show the samples in the main area until the first question.
-        if not st.session_state.messages and "pending_query" not in st.session_state:
-            st.markdown("**Not sure where to start? Try one of these:**")
-            cols = st.columns(2)
-            for i, question in enumerate(SAMPLE_QUESTIONS):
-                cols[i % 2].button(
-                    question,
-                    key=f"sample_main_{i}",
-                    on_click=_queue_question,
-                    args=(question,),
-                    use_container_width=True,
-                )
+    # Empty state: sample questions until the first question is asked.
+    if SAMPLE_QUESTIONS and not st.session_state.messages and "pending_query" not in st.session_state:
+        st.markdown("**Try one of these:**")
+        cols = st.columns(2)
+        for i, question in enumerate(SAMPLE_QUESTIONS):
+            cols[i % 2].button(
+                question,
+                key=f"sample_main_{i}",
+                on_click=_queue_question,
+                args=(question,),
+                use_container_width=True,
+            )
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message.get("retrieval_stats"):
-                render_stats_caption(message["retrieval_stats"], message.get("confidence", "high"))
-            if message.get("sources"):
-                with st.expander("Sources"):
-                    for i, source in enumerate(message["sources"], 1):
-                        st.markdown(f"**[{i}]** {format_source(source)}")
+            if message["role"] == "assistant":
+                render_assistant_message(message)
+            else:
+                st.markdown(message["content"])
 
-    typed_query = st.chat_input("Ask a question...", max_chars=MAX_QUESTION_CHARS * 2)
+    typed_query = st.chat_input("Ask about results, strategy, risks, outlook...", max_chars=MAX_QUESTION_CHARS * 2)
     query, input_error = validate_question(typed_query or st.session_state.pop("pending_query", None))
     if input_error:
         st.warning(input_error)
-    if query:
-        st.session_state.messages.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.markdown(query)
+    if not query:
+        return
 
-        with st.chat_message("assistant"):
-            with st.spinner("Searching the report..."):
-                result = answer(query)
-                sources = result["sources"]
-                retrieval_stats = result["retrieval_stats"]
-                confidence = result.get("confidence", "high")
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
 
-            if "stream" in result:
-                # Text appears as the model writes it instead of all at once.
-                answer_text = st.write_stream(result["stream"])
-                if result["state"]["declined"]:
-                    # The model found no answer in the passages: show it as LOW.
-                    confidence = "low"
-                    sources = []
-                    retrieval_stats["declined_by_model"] = True
-            else:
-                answer_text = result["answer"]
-                st.markdown(answer_text)
+    with st.chat_message("assistant"):
+        started = time.time()
+        # Live pipeline progress: each retrieval stage reports as it starts.
+        # Steps are visible while it works, then fold away once the answer starts.
+        with st.status("Searching the report...", expanded=True) as status:
+            result = answer(query, on_step=status.write)
+            stats = result["retrieval_stats"]
+            n = len(result["sources"])
+            status.update(
+                label=(f"Retrieved {n} passage{'s' if n != 1 else ''} in {time.time() - started:.1f}s"
+                       if n else f"No matching passages ({time.time() - started:.1f}s)"),
+                state="complete",
+                expanded=False,
+            )
+        sources, confidence = result["sources"], result.get("confidence", "high")
 
-            render_stats_caption(retrieval_stats, confidence)
+        if "stream" in result:
+            # Text appears as the model writes it instead of all at once.
+            answer_text = st.write_stream(result["stream"])
+            if result["state"]["declined"]:
+                confidence, sources = "low", []
+                stats["declined_by_model"] = True
+        else:
+            answer_text = result["answer"]
+            st.markdown(answer_text)
+        stats["total_ms"] = (time.time() - started) * 1000
 
-            if sources:
-                with st.expander("Sources"):
-                    for i, source in enumerate(sources, 1):
-                        st.markdown(f"**[{i}]** {format_source(source)}")
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": answer_text,
-                "sources": sources,
-                "retrieval_stats": retrieval_stats,
-                "confidence": confidence,
-            })
+        message = {
+            "role": "assistant",
+            "content": answer_text,
+            "sources": sources,
+            "retrieval_stats": stats,
+            "confidence": confidence,
+        }
+        render_answer_meta(stats, confidence)
+        render_sources(sources)
+    st.session_state.messages.append(message)
 
 
 if __name__ == "__main__":
