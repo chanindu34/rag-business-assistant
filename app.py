@@ -1,99 +1,44 @@
 """
-Business Intelligence Assistant
+Business Intelligence Assistant: Streamlit UI.
 
-Streamlit chat app that answers questions about John Keells Holdings'
-Annual Report 2025/26 using PRODUCTION RAG:
-- HyDE (hypothetical document embeddings)
-- Hybrid search (BM25 + vector with RRF)
-- Cross-encoder reranking
-- Confidence guardrails (graceful failure on low confidence)
-
-Includes numbered source citations.
+Answers questions about John Keells Holdings' Annual Report 2025/26 with
+page citations. The pipeline itself (routing, HyDE, hybrid search, reranking,
+confidence tiers, prompt and refusal handling) lives in pipeline.py and
+retriever.py; this file is only the chat interface around it.
 """
 
-import json
+import hashlib
 import logging
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-import chromadb
 import streamlit as st
-from chromadb import EmbeddingFunction
-from google import genai
 
-from config import (
-    CHROMA_DB_PATH,
-    COLLECTION_NAME,
-    DEFAULT_TOP_K,
-    EMBED_RATE_LIMIT_DELAY_SECONDS,
-    EMBEDDING_MODEL,
-    ANSWER_CACHE_PATH,
-    GENERATION_FALLBACKS,
-    GENERATION_MODEL,
-    BM25_WEIGHT,
-    HIGH_THRESHOLD,
-    HYDE_FALLBACKS,
-    HYDE_MODEL,
-    LOW_THRESHOLD,
-    MAX_QUESTION_CHARS,
-    MAX_RETRIES,
-    NUM_CANDIDATES,
-    USE_HYDE,
-    VECTOR_WEIGHT,
-    RERANKER_MODEL,
-    REQUEST_TIMEOUT_SECONDS,
-    RRF_K,
-    SAMPLE_QUESTIONS,
-    SOURCE_PREVIEW_CHARS,
-    parents_path,
+from config import DEFAULT_TOP_K, MAX_QUESTION_CHARS, RERANKER_MODEL, SAMPLE_QUESTIONS, SOURCE_PREVIEW_CHARS
+from llm import QuotaExhaustedError
+from pipeline import (
+    AMBIGUOUS_NOTE,
+    LOW_CONFIDENCE_MESSAGE,
+    build_prompt,
+    build_rag,
+    load_index,
+    make_client,
+    make_gateways,
+    peek_refusal,
+    sources_from_result,
+    validate_question,
 )
-from retriever import ProductionRAG
 from query_condensation import QueryCondenser
-from llm import GeminiGateway, QuotaExhaustedError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        api_key = None
-
-if not api_key:
-    st.error("No API key found. Set GEMINI_API_KEY as an environment variable (local) or in Streamlit Cloud secrets (deployed).")
-    st.stop()
-
-from google.genai import types as genai_types
-
-# A hung request must not hang the UI forever. HttpOptions.timeout is in ms.
-client_genai = genai.Client(
-    api_key=api_key,
-    http_options=genai_types.HttpOptions(timeout=REQUEST_TIMEOUT_SECONDS * 1000),
-)
-
-
-def get_embedding(text: str, max_retries: int = MAX_RETRIES) -> List[float]:
-    """Embed text via the Gemini embedding API, retrying with exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            result = client_genai.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=text
-            )
-            return result.embeddings[0].values
-        except Exception:
-            logger.warning("Embedding attempt %d/%d failed", attempt + 1, max_retries, exc_info=True)
-            time.sleep(2 ** attempt)
-    raise RuntimeError("Failed to embed after retries.")
-
 
 def _setting(name: str, default):
     """Environment variable, then Streamlit secret, then config.yaml default.
-    Lets a host (e.g. Streamlit Cloud) switch to a smaller reranker without
-    a code change."""
+    Lets a host (e.g. Streamlit Cloud) switch to a smaller reranker or set the
+    API key without a code change."""
     if os.environ.get(name):
         return os.environ[name]
     try:
@@ -102,102 +47,27 @@ def _setting(name: str, default):
         return default
 
 
-def validate_question(raw: str):
-    """Return (clean_question, error_message). Runs before any API call."""
-    q = " ".join((raw or "").split())  # collapse whitespace and newlines
-    q = "".join(ch for ch in q if ch.isprintable())
-    if not q:
-        return None, None
-    if len(q) > MAX_QUESTION_CHARS:
-        return None, (f"That question is {len(q):,} characters long. Please keep it under "
-                      f"{MAX_QUESTION_CHARS} characters and ask about one thing at a time.")
-    return q, None
-
-
-def get_gateways():
-    return _get_gateways(_code_version())
-
-
-@st.cache_resource
-def _get_gateways(code_version: str):
-    """One gateway for answers, one for HyDE drafts. Shared across sessions,
-    rebuilt when the code changes (see _code_version)."""
-    answer_models = [GENERATION_MODEL] + [m for m in GENERATION_FALLBACKS if m != GENERATION_MODEL]
-    hyde_models = [HYDE_MODEL] + [m for m in HYDE_FALLBACKS if m != HYDE_MODEL]
-    exhausted = set()  # shared: a model that ran dry for HyDE is dry for answers too
-    answers = GeminiGateway(
-        client_genai, answer_models, cache_path=ANSWER_CACHE_PATH,
-        exhausted_today=exhausted, never_cache={"NOT_IN_REPORT"},
-    )
-    hyde = GeminiGateway(
-        client_genai, hyde_models, exhausted_today=exhausted,
-        cache_path=ANSWER_CACHE_PATH.replace(".json", "_hyde.json") if ANSWER_CACHE_PATH else None,
-    )
-    return answers, hyde
-
-
-def generate_answer(prompt: str) -> str:
-    answers, _ = get_gateways()
-    return answers.generate(prompt, purpose="answer")
-
-
-def generate_hyde(prompt: str) -> str:
-    _, hyde = get_gateways()
-    return hyde.generate(prompt, purpose="hyde", max_output_tokens=200, temperature=0.7)
-
-
-class GeminiEmbeddingFunction(EmbeddingFunction):
-    """Chroma embedding function backed by the Gemini embedding API."""
-
-    def __init__(self):
-        pass
-
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        embeddings = []
-        for text in input:
-            embeddings.append(get_embedding(text))
-            time.sleep(EMBED_RATE_LIMIT_DELAY_SECONDS)
-        return embeddings
-
-
-@st.cache_resource
-def get_collection():
-    """Open the Chroma collection once per process.
-
-    Streamlit reruns this script on every interaction. Creating a new
-    PersistentClient on each rerun races on the same SQLite file and causes
-    "Could not connect to tenant default_tenant".
-    """
-    db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    # No embedding function: the app never asks Chroma to embed text. Query
-    # vectors are made by the retriever, which also searches in numpy.
-    return db_client.get_collection(name=COLLECTION_NAME)
-
-
-try:
-    collection = get_collection()
-except Exception:
-    logger.exception("Could not open collection %r in %r", COLLECTION_NAME, CHROMA_DB_PATH)
-    st.error(
-        f"Collection '{COLLECTION_NAME}' was not found in '{CHROMA_DB_PATH}'. "
-        "Check config.yaml or re-run ingest.py."
-    )
+api_key = _setting("GEMINI_API_KEY", None)
+if not api_key:
+    st.error("No API key found. Set GEMINI_API_KEY as an environment variable (local) or in Streamlit Cloud secrets (deployed).")
     st.stop()
+
+client_genai = make_client(api_key)
 
 
 def _code_version() -> str:
-    """Fingerprint of the files that shape the pipeline object.
+    """Fingerprint of the files that shape the cached objects.
 
     st.cache_resource keys on the cached function's own source, so after a
     deploy that only changes retriever.py the old pipeline object (with the
     old methods) would be reused. Passing this fingerprint as an argument
     forces a rebuild whenever any of these files change.
     """
-    import hashlib
     h = hashlib.sha256()
-    for name in ("retriever.py", "semantic_router.py", "confidence_tiers.py", "llm.py", "config.yaml"):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("pipeline.py", "retriever.py", "semantic_router.py", "confidence_tiers.py", "llm.py", "config.yaml"):
         try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), "rb") as f:
+            with open(os.path.join(here, name), "rb") as f:
                 h.update(f.read())
         except OSError:
             pass
@@ -205,59 +75,42 @@ def _code_version() -> str:
 
 
 @st.cache_resource
+def _get_gateways(code_version: str):
+    """Answer and HyDE gateways, shared across sessions, rebuilt on code change."""
+    return make_gateways(client_genai)
+
+
+def get_gateways():
+    return _get_gateways(_code_version())
+
+
+def generate_hyde(prompt: str) -> str:
+    _, hyde = get_gateways()
+    return hyde.generate(prompt, purpose="hyde", max_output_tokens=200, temperature=0.7)
+
+
+@st.cache_resource
 def load_production_rag(code_version: str):
-    """Initialize the production RAG pipeline (cached per code version)."""
+    """Build the pipeline once per process and code version.
+
+    Opening Chroma once here also avoids the "Could not connect to tenant
+    default_tenant" race that happens when every Streamlit rerun opens it.
+    """
     logger.info("Loading ProductionRAG pipeline...")
-
-    all_results = collection.get(include=["documents", "embeddings", "metadatas"])
-    chunks = all_results["documents"]
-    embeddings = all_results["embeddings"]
-    metadatas = all_results["metadatas"]
-
-    parents = {}
-    p_path = parents_path(COLLECTION_NAME)
-    if os.path.exists(p_path):
-        with open(p_path, encoding="utf-8") as f:
-            parents = json.load(f)
-    else:
-        logger.warning("No parent chunks at %s; the answer model will see child chunks only.", p_path)
-
-    # Indexes built by the current ingest.py record the document task type.
-    doc_task_type = (collection.metadata or {}).get("doc_task_type")
-
-    if not chunks or embeddings is None or len(chunks) != len(embeddings):
-        raise RuntimeError(
-            f"Index is empty or inconsistent: {len(chunks or [])} documents, "
-            f"{0 if embeddings is None else len(embeddings)} embeddings. Re-run ingest.py."
-        )
-
-    logger.info(f"Loaded {len(chunks)} chunks and {len(parents)} parents from {COLLECTION_NAME}")
-
-    rag = ProductionRAG(
-        chunks=chunks,
-        embeddings=embeddings,
-        embedding_model=EMBEDDING_MODEL,
-        generation_model=GENERATION_MODEL,
-        llm_client=client_genai,
-        reranker_model=_setting("RAG_MODELS_RERANKER", RERANKER_MODEL),
+    return build_rag(
+        client_genai,
+        load_index(),
         hyde_generate_fn=generate_hyde,
-        use_hyde=USE_HYDE,
-        high_threshold=HIGH_THRESHOLD,
-        low_threshold=LOW_THRESHOLD,
-        num_candidates=NUM_CANDIDATES,
-        rrf_k=RRF_K,
-        bm25_weight=BM25_WEIGHT,
-        vector_weight=VECTOR_WEIGHT,
-        metadatas=metadatas,
-        parents=parents,
-        doc_task_type=doc_task_type,
-        query_task_type="RETRIEVAL_QUERY" if doc_task_type else None,
+        reranker_model=_setting("RAG_MODELS_RERANKER", RERANKER_MODEL),
     )
 
-    return rag
 
-
-rag_pipeline = load_production_rag(_code_version())
+try:
+    rag_pipeline = load_production_rag(_code_version())
+except Exception:
+    logger.exception("Could not load the index")
+    st.error("The search index could not be loaded. Check `retrieval.collection` in config.yaml or re-run ingest.py.")
+    st.stop()
 
 
 @st.cache_resource
@@ -278,12 +131,7 @@ def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None
     result = rag_pipeline.retrieve(condensed_query, top_k=k, on_step=on_step)
     stats = result["retrieval_stats"]
     stats["follow_up"] = previous_question is not None
-    sources, seen = [], set()
-    for r in result["final_chunks"]:
-        if r.get("parent_id") in seen:
-            continue  # two matching children in one parent: send the parent once
-        seen.add(r.get("parent_id"))
-        sources.append({"page": r.get("page"), "text": r.get("context", r["chunk"]), "match": r["chunk"]})
+    sources = sources_from_result(result["final_chunks"])
     return {
         "chunks": sources,
         "retrieval_stats": stats,
@@ -291,50 +139,6 @@ def retrieve(query: str, k: int = DEFAULT_TOP_K, chat_history: List[Dict] = None
         "previous_question": previous_question,
         "resolved_query": condensed_query,
     }
-
-
-def _source_text(source) -> str:
-    return source["text"] if isinstance(source, dict) else source
-
-
-def build_prompt(query: str, chunks: List, previous_question: Optional[str] = None) -> str:
-    """Build a grounded, citation-instructed prompt from retrieved sources."""
-    lines = []
-    for i, c in enumerate(chunks, 1):
-        page = c.get("page") if isinstance(c, dict) else None
-        label = f"[{i}] (page {page})" if page else f"[{i}]"
-        lines.append(f"{label} {_source_text(c)}\n\n")
-    numbered_context = "".join(lines)
-    follow_up = (
-        f'This is a follow-up to the earlier question: "{previous_question}". '
-        "Interpret references like \"it\" or \"that\" accordingly.\n\n"
-        if previous_question else ""
-    )
-    return f"""Answer the question using ONLY the information in the context below.
-Do NOT use any outside knowledge, even if you recognize the company or topic.
-If the context does not contain the answer at all, reply with exactly NOT_IN_REPORT and nothing else.
-If it answers only part of the question, answer that part and say which part the context doesn't cover.
-Cite which source number(s) you used in brackets after each claim, like [1] or [1][3].
-
-<context>
-{numbered_context}
-</context>
-
-{follow_up}Question: {query}
-
-Answer:"""
-
-
-LOW_CONFIDENCE_MESSAGE = (
-    "I do not have sufficient internal documentation to answer this question with confidence. Please try:\n"
-    "1. Rephrasing your question more specifically\n"
-    "2. Checking if the information exists in the annual report\n"
-    "3. Searching online for additional context"
-)
-AMBIGUOUS_NOTE = (
-    "\n\n> **Moderate confidence.** The retrieved passages only partly match this question. "
-    "Check the sources below before relying on this answer."
-)
 
 
 def answer(query: str, k: int = DEFAULT_TOP_K, on_step=None) -> Dict:
@@ -354,30 +158,20 @@ def answer(query: str, k: int = DEFAULT_TOP_K, on_step=None) -> Dict:
     return {**base, "stream": _answer_stream(prompt, confidence, state), "state": state, "sources": chunks}
 
 
-REFUSAL_TOKEN = "NOT_IN_REPORT"
-
-
 def _answer_stream(prompt: str, confidence: str, state: Dict):
     """Yield answer text as it is generated.
 
-    The first few characters are held back until we know whether the model
-    is refusing (NOT_IN_REPORT). A refusal becomes the standard decline
-    message and sets state["declined"], so the UI shows LOW confidence.
-    Quota failure becomes an explanatory message.
+    A NOT_IN_REPORT refusal becomes the standard decline message and sets
+    state["declined"], so the UI shows it as not found. Quota failure becomes
+    an explanatory message.
     """
     answers, _ = get_gateways()
     try:
-        pieces = answers.stream(prompt, purpose="answer")
-        head = ""
-        for piece in pieces:
-            head += piece
-            if len(head.strip()) >= len(REFUSAL_TOKEN) or not REFUSAL_TOKEN.startswith(head.strip()[:len(REFUSAL_TOKEN)]):
-                break
-        if head.strip().startswith(REFUSAL_TOKEN):
+        refused, pieces = peek_refusal(answers.stream(prompt, purpose="answer"))
+        if refused:
             state["declined"] = True
             yield LOW_CONFIDENCE_MESSAGE
             return
-        yield head
         yield from pieces
     except QuotaExhaustedError as e:
         logger.warning("%s", e)

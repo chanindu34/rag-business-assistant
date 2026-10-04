@@ -57,6 +57,7 @@ GENERATION_FALLBACKS = _cfg["models"].get("generation_fallbacks", [])
 HYDE_MODEL = _cfg["models"].get("hyde", GENERATION_MODEL)
 HYDE_FALLBACKS = _cfg["models"].get("hyde_fallbacks", [])
 JUDGE_MODEL = _cfg["models"]["judge"]
+JUDGE_FALLBACKS = _cfg["models"].get("judge_fallbacks", [])
 RERANKER_MODEL = _cfg["models"]["reranker"]
 
 COLLECTION_NAME = _cfg["retrieval"]["collection"]

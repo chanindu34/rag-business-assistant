@@ -1,0 +1,173 @@
+# Evaluation set for the JKH Annual Report 2025/26 assistant.
+#
+# Every expected value was copied from the report text, and
+# `python3 evaluate.py --check` verifies each one appears on its listed page.
+#
+# Fields
+#   type          lookup | change | explanation | follow_up | unanswerable
+#   pages         pages where the answer appears (retrieval hit = any one retrieved)
+#   must_include  every item must appear in the answer
+#   any_of        at least one item must appear (for alternate phrasings)
+#   history       earlier questions in the same chat (follow_up only)
+
+- id: pbt_recurring
+  type: lookup
+  question: What was the Group's recurring profit before tax in 2025/26?
+  pages: [13, 14]
+  must_include: ["35.72"]
+
+- id: pbt_reported
+  type: lookup
+  question: What was the Group's reported profit before tax for the year?
+  pages: [14]
+  must_include: ["37.69"]
+
+- id: rooms_total
+  type: lookup
+  question: How many hotel rooms does the Group manage in Sri Lanka and the Maldives?
+  pages: [10, 36]
+  any_of: ["3,468", "3,577"]
+
+- id: codsl_rooms
+  type: lookup
+  question: How many rooms does City of Dreams Sri Lanka have?
+  pages: [36]
+  must_include: ["800"]
+
+- id: final_dividend
+  type: lookup
+  question: What final dividend per share did the Board declare?
+  pages: [23, 27]
+  any_of: ["0.10", "10 cents"]
+
+- id: market_cap
+  type: lookup
+  question: What was the Company's market capitalisation at the end of 2025/26?
+  pages: [27]
+  must_include: ["325,667"]
+
+- id: tourist_arrivals
+  type: lookup
+  question: How many tourists visited Sri Lanka in calendar year 2025?
+  pages: [12]
+  must_include: ["2.36"]
+
+- id: inflation
+  type: lookup
+  question: What was Sri Lanka's inflation rate in April 2026?
+  pages: [12]
+  must_include: ["5.4%"]
+
+- id: gdp_growth
+  type: lookup
+  question: What was Sri Lanka's GDP growth rate in 2025?
+  pages: [12]
+  must_include: ["5%"]
+
+- id: rebuilding_sl
+  type: lookup
+  question: How much did the Group contribute to the Rebuilding Sri Lanka initiative?
+  pages: [12, 22]
+  must_include: ["500 million"]
+
+- id: kandy_walk
+  type: lookup
+  question: What stake in Kandy Walk Inn Limited was divested?
+  pages: [7]
+  must_include: ["98.39%"]
+
+- id: net_debt
+  type: lookup
+  question: What is the Group's net debt to EBITDA ratio?
+  pages: [11]
+  any_of: ["2 times", "2x", "2.0x", "two times"]
+
+- id: reserves
+  type: lookup
+  question: What level did Sri Lanka's gross official reserves reach in April 2026?
+  pages: [12]
+  must_include: ["6.8"]
+
+- id: ebitda_group
+  type: change
+  question: How much did Group EBITDA grow in 2025/26?
+  pages: [3, 11, 13, 14]
+  must_include: ["75%", "80.01"]
+
+- id: ebitda_retail
+  type: change
+  question: How did the Retail industry group's recurring EBITDA change?
+  pages: [15]
+  must_include: ["190%", "31.74"]
+
+- id: ebitda_leisure
+  type: change
+  question: How much did Leisure recurring EBITDA increase?
+  pages: [16]
+  must_include: ["176%", "12.49"]
+
+- id: ebitda_consumer_foods
+  type: change
+  question: How did Consumer Foods perform in 2025/26?
+  pages: [15]
+  must_include: ["7.57", "13%"]
+
+- id: ebitda_financial_services
+  type: change
+  question: By how much did Financial Services recurring EBITDA grow?
+  pages: [18]
+  must_include: ["4%", "11.37"]
+
+- id: ebitda_property
+  type: change
+  question: How did the Property industry group's recurring EBITDA change?
+  pages: [18]
+  must_include: ["106%", "2.96"]
+
+- id: key_risks
+  type: explanation
+  question: What are the key risks facing the Group?
+  pages: [141]
+  must_include: ["cybersecurity", "macroeconomic"]
+
+- id: retail_driver
+  type: explanation
+  question: What drove the improvement in Retail EBITDA?
+  pages: [15]
+  any_of: ["NEV", "JKCG", "New Energy Vehicle", "BYD"]
+
+- id: wct_performance
+  type: explanation
+  question: How did the West Container Terminal perform during the year?
+  pages: [11]
+  any_of: ["throughput", "profit after tax", "PAT"]
+
+- id: followup_prior_ebitda
+  type: follow_up
+  history: ["How much did Group EBITDA grow in 2025/26?"]
+  question: What was it in the previous year?
+  pages: [14]
+  must_include: ["45.85"]
+
+- id: followup_exchange_rate
+  type: follow_up
+  history: ["What was Sri Lanka's inflation rate in April 2026?"]
+  question: What about the exchange rate?
+  pages: [12]
+  must_include: ["309"]
+
+- id: oos_france
+  type: unanswerable
+  question: What is the capital of France?
+
+- id: oos_cricket
+  type: unanswerable
+  question: Who won the 2023 Cricket World Cup?
+
+- id: oos_other_company
+  type: unanswerable
+  question: How many employees does Dialog Axiata have?
+
+- id: oos_forecast
+  type: unanswerable
+  question: What will the Group's EBITDA be in 2030?

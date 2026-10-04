@@ -1,5 +1,7 @@
 # Business Intelligence Assistant
 
+[![tests](https://github.com/chanindu34/rag-business-assistant/actions/workflows/tests.yml/badge.svg)](https://github.com/chanindu34/rag-business-assistant/actions/workflows/tests.yml)
+
 A retrieval-augmented generation (RAG) system that answers questions about John Keells Holdings' Annual Report 2025/26, citing the page each claim comes from.
 
 **Live demo:** https://rag-business-assistant-pdpsjsuaxzvmaaff8edv3b.streamlit.app
@@ -78,6 +80,7 @@ Python, Google Gemini API, ChromaDB, rank-bm25, sentence-transformers (cross-enc
 
 ```
 app.py                 Streamlit UI: chat, live pipeline status, streaming, sources
+pipeline.py            Builds the pipeline without any UI; shared by the app, tests and evaluation
 retriever.py           Router, HyDE, hybrid search with RRF, reranker, confidence tiers
 semantic_router.py     Decides when HyDE is worth an LLM call
 query_condensation.py  Resolves follow-up questions without an API call
@@ -85,10 +88,13 @@ confidence_tiers.py    High / moderate / low tiers on the reranker score
 llm.py                 Gemini gateway: model fallback, quota handling, streaming, answer cache
 ingest.py              Builds the index: page extraction, parent-child chunks, batched cached embeddings
 embedding_cache.py     On-disk embedding cache
+evaluate.py            Runs the evaluation set and writes a scored report to eval/results/
+eval/questions.yaml    28 questions with expected figures and source pages, checked against the report
 debug_retrieval.py     Shows where the correct passage ranks at every stage
 list_models.py         Lists the Gemini models your API key can use
 config.yaml            Every tunable setting, with the reasoning behind non-obvious values
 chroma_db/             Prebuilt index (committed)
+tests/                 85 unit tests: tokenizer, RRF, router, follow-ups, refusal detection, model failover
 experimental/          Earlier modules not used by the app, with notes on why
 ```
 
@@ -104,6 +110,22 @@ streamlit run app.py
 The first start downloads the reranker (about 1.1 GB). After that, setting `HF_HUB_OFFLINE=1` in `.env` skips the update check, which helps on networks that block Hugging Face.
 
 Run `python3 list_models.py` to see which Gemini models your key can use, and edit the model chain in `config.yaml` to match.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q tests
+```
+
+The tests use fake Gemini clients and a fake reranker: no API key, no network, no model download, under a second. They run on every push via GitHub Actions.
+
+### Evaluation
+
+```bash
+python3 evaluate.py --check     # verify every expected answer appears on its listed page (no API)
+python3 evaluate.py --judge     # full run, about 3 API calls per question
+``` Each one guards a behaviour that was once broken or easy to break, for example stemming ("manage" must match "management"), the HyDE rule for change questions, never retrying a daily quota error, and detecting a `NOT_IN_REPORT` refusal even when it streams in pieces.
 
 ### Docker
 
