@@ -228,7 +228,16 @@ def escape_markdown(text: str) -> str:
     return _MD_SPECIAL.sub(r"\\\1", text)
 
 
+# '*' or '**' with a number or ')' just before (spaces allowed) and a number or '(' after.
+_ARITH_STARS = re.compile(r"(?<=[\d)])(\s*)(\*{1,2})(?=\s*[\d(])")
+
+
 def plain_answer(text: str) -> str:
-    """Stop '$...$' in model output rendering as LaTeX maths. Safe to apply twice."""
-    return re.sub(r"(?<!\\)\$", r"\\$", text)
+    """Keep model maths literal while leaving its bold and lists alone.
+
+    '$...$' would render as LaTeX, and '*' or '**' between numbers ('9**9**9',
+    '2 * 3') would turn into bold or italics. Safe to apply twice.
+    """
+    text = re.sub(r"(?<!\\)\$", r"\\$", text)
+    return _ARITH_STARS.sub(lambda m: m.group(1) + "\\*" * len(m.group(2)), text)
 

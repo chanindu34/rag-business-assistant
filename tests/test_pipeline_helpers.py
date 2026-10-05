@@ -100,3 +100,10 @@ def test_dollar_signs_do_not_render_as_maths_and_escaping_twice_is_safe():
     from pipeline import plain_answer
     assert plain_answer("between $5 and $6") == r"between \$5 and \$6"
     assert plain_answer(plain_answer("costs $5")) == r"costs \$5"
+
+
+def test_maths_in_answers_stays_literal_but_bold_numbers_still_work():
+    from pipeline import plain_answer
+    assert plain_answer("9**9**9 is too large") == r"9\*\*9\*\*9 is too large"
+    assert plain_answer("EBITDA was **Rs. 80.01 billion**") == "EBITDA was **Rs. 80.01 billion**"
+    assert plain_answer("grew **75%** (page 14)") == "grew **75%** (page 14)"
