@@ -45,3 +45,6 @@ RAG_Business_Assistant_Interview_Prep.pdf
 
 # Local evaluation console logs
 eval_*_results.txt
+
+# Backups of personal notes
+*.before_fix.md

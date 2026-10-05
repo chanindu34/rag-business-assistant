@@ -115,7 +115,7 @@ debug_retrieval.py     Shows where the correct passage ranks at every stage
 list_models.py         Lists the Gemini models your API key can use
 config.yaml            Every tunable setting, with the reasoning behind non-obvious values
 chroma_db/             Prebuilt index (committed)
-tests/                 85 unit tests: tokenizer, RRF, router, follow-ups, refusal detection, model failover
+tests/                 87 unit tests: tokenizer, RRF, router, follow-ups, refusal detection, model failover
 experimental/          Earlier modules not used by the app, with notes on why
 ```
 

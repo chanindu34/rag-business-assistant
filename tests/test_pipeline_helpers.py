@@ -88,3 +88,15 @@ def test_prompt_has_page_labels_refusal_contract_and_follow_up():
     assert REFUSAL_TOKEN in prompt
     assert 'follow-up to the earlier question: "How much did EBITDA grow?"' in prompt
     assert prompt.rstrip().endswith("Answer:")
+
+
+def test_user_text_shows_literally():
+    from pipeline import escape_markdown
+    assert escape_markdown("9**9**9") == r"9\*\*9\*\*9"
+    assert escape_markdown("plain words") == "plain words"
+
+
+def test_dollar_signs_do_not_render_as_maths_and_escaping_twice_is_safe():
+    from pipeline import plain_answer
+    assert plain_answer("between $5 and $6") == r"between \$5 and \$6"
+    assert plain_answer(plain_answer("costs $5")) == r"costs \$5"

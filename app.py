@@ -25,7 +25,9 @@ from pipeline import (
     load_index,
     make_client,
     make_gateways,
+    escape_markdown,
     peek_refusal,
+    plain_answer,
     sources_from_result,
     validate_question,
 )
@@ -242,7 +244,7 @@ def _new_chat() -> None:
 
 
 def render_assistant_message(message: Dict) -> None:
-    st.markdown(message["content"])
+    st.markdown(plain_answer(message["content"]))
     if message.get("retrieval_stats"):
         render_answer_meta(message["retrieval_stats"], message.get("confidence", "high"))
     render_sources(message.get("sources"))
@@ -283,7 +285,7 @@ def main():
             if message["role"] == "assistant":
                 render_assistant_message(message)
             else:
-                st.markdown(message["content"])
+                st.markdown(escape_markdown(message["content"]))
 
     typed_query = st.chat_input("Ask about results, strategy, risks, outlook...", max_chars=MAX_QUESTION_CHARS * 2)
     query, input_error = validate_question(typed_query or st.session_state.pop("pending_query", None))
@@ -294,7 +296,7 @@ def main():
 
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
-        st.markdown(query)
+        st.markdown(escape_markdown(query))
 
     with st.chat_message("assistant"):
         started = time.time()
@@ -314,13 +316,13 @@ def main():
 
         if "stream" in result:
             # Text appears as the model writes it instead of all at once.
-            answer_text = st.write_stream(result["stream"])
+            answer_text = st.write_stream(plain_answer(piece) for piece in result["stream"])
             if result["state"]["declined"]:
                 confidence, sources = "low", []
                 stats["declined_by_model"] = True
         else:
             answer_text = result["answer"]
-            st.markdown(answer_text)
+            st.markdown(plain_answer(answer_text))
         stats["total_ms"] = (time.time() - started) * 1000
 
         message = {

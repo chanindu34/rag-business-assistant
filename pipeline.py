@@ -8,6 +8,7 @@ build the pipeline from here, so they exercise exactly the same code.
 import json
 import logging
 import os
+import re
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from config import (
@@ -217,3 +218,17 @@ def peek_refusal(pieces: Iterable[str], token: str = REFUSAL_TOKEN) -> Tuple[boo
         yield from it
 
     return False, rest()
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]<>()#+\-.!|~$])")
+
+
+def escape_markdown(text: str) -> str:
+    """Show user text literally: '9**9**9' must not render as a bold '999'."""
+    return _MD_SPECIAL.sub(r"\\\1", text)
+
+
+def plain_answer(text: str) -> str:
+    """Stop '$...$' in model output rendering as LaTeX maths. Safe to apply twice."""
+    return re.sub(r"(?<!\\)\$", r"\\$", text)
+
