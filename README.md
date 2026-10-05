@@ -64,11 +64,32 @@ These came from testing the system on real questions, using `debug_retrieval.py`
 6. **The report contradicts itself.** Page 10 gives 3,468 rooms under management "as at 31 March 2026"; page 36 gives 3,577 with no date. The assistant reports both, with citations, rather than picking one.
 7. **Prompt-only grounding has a limit.** An earlier version named an ESG initiative that appeared in none of the retrieved passages. Instructions alone did not stop it, which is why the system now has an explicit refusal path and why claim-level faithfulness checking is on the list below.
 
+## Evaluation results
+
+Run on 5 October 2026 with `python3 evaluate.py --judge`.
+
+| Metric | Result |
+| --- | --- |
+| Retrieval: a correct page reached the answer model | 24 / 24 |
+| Answer accuracy: every expected figure present | 24 / 24 |
+| Unanswerable questions correctly declined | 4 / 4 |
+| Answerable questions wrongly declined | 0 / 24 |
+| Faithfulness: the judge found no unsupported claim | 24 / 24 |
+| End to end latency, median | 12.2 s |
+
+How to read these numbers:
+
+- **The raw report said 23 / 24.** The one failure was the evaluator, not the system: it answered "Rs. 35,723 million" and the key expected "35.72" (billion). The key now accepts both. Failures are checked by hand before a metric is trusted.
+- **Reranker scores confirm finding 4.** Answerable questions scored 0.51 to 1.00; unanswerable ones scored 0.02, 0.10, 0.62 and 1.00. Two out of scope questions scored as high as real ones, so no threshold could separate them. All four were declined by the answer model's `NOT_IN_REPORT` decision.
+- **28 questions is a small set.** At 24 / 24 the 95 percent interval for accuracy is still roughly 86 to 100 percent. It catches regressions; it cannot rank two close configurations.
+- **Latency p95 was 127 s** because Gemini returned 503 and 504 errors and some models ran out of daily quota during the run, so requests moved down the model chain. The median is the representative figure.
+- **Not every answer came from the first choice model.** gemini-3.8-flash ran out of quota part way through; the run does not yet record which model produced each answer.
+
 ## Known limitations
 
 - **Coverage:** 82 of 612 pages. Tables are flattened, so questions about the financial statements will be declined.
 - **Reranker:** `bge-reranker-base` tends to rank industry group figures above Group level ones. `BAAI/bge-reranker-v2-m3` should do better but is twice the size; it is a one-line change in `config.yaml` and measurable with `debug_retrieval.py`.
-- **Confidence thresholds** (0.6 and 0.05) are set from a handful of observed cases, not yet calibrated on a labelled evaluation set.
+- **Confidence thresholds** (0.6 and 0.05) only filter obvious junk. The evaluation shows reranker scores cannot separate answerable from unanswerable questions, so the answer model makes that call.
 - **Follow-up detection** is a rule-based heuristic. An LLM rewrite would handle more phrasings at the cost of one API call per follow-up.
 - **Not multi-tenant:** no authentication, one Streamlit process, local Chroma files. Fine for a demo, not for production traffic.
 
@@ -118,14 +139,16 @@ pip install -r requirements-dev.txt
 pytest -q tests
 ```
 
-The tests use fake Gemini clients and a fake reranker: no API key, no network, no model download, under a second. They run on every push via GitHub Actions.
+The tests use fake Gemini clients and a fake reranker: no API key, no network, no model download, under a second. They run on every push via GitHub Actions. Each one guards a behaviour that was once broken or easy to break, for example stemming ("manage" must match "management"), the HyDE rule for change questions, never retrying a daily quota error, and detecting a `NOT_IN_REPORT` refusal even when it streams in pieces.
 
 ### Evaluation
 
 ```bash
 python3 evaluate.py --check     # verify every expected answer appears on its listed page (no API)
 python3 evaluate.py --judge     # full run, about 3 API calls per question
-``` Each one guards a behaviour that was once broken or easy to break, for example stemming ("manage" must match "management"), the HyDE rule for change questions, never retrying a daily quota error, and detecting a `NOT_IN_REPORT` refusal even when it streams in pieces.
+```
+
+28 questions with answers and page numbers taken from the report (`eval/questions.yaml`): lookups, change questions, explanations, follow ups and four questions the report cannot answer. `--check` verifies the answer key against the indexed text without any API call. The judge is a different model from the one that answers. Results are in [Evaluation results](#evaluation-results).
 
 ### Docker
 
@@ -149,7 +172,7 @@ python3 ingest.py               # about 10 embedding requests
 
 ## What I'd build next
 
-- **An evaluation set** of questions with answers and page numbers taken from the report, to calibrate the confidence thresholds and catch regressions in CI.
+- **A larger evaluation set** (100 or more questions) run on a schedule, recording which model answered each question, so two configurations can be compared fairly.
 - **Claim-level faithfulness checking:** verify each cited sentence against its source passage before showing the answer.
 - **Layout-aware parsing** (for example LlamaParse or Docling) to bring the financial statement tables in with their structure intact.
 - **A stronger reranker**, evaluated against the current one with `debug_retrieval.py`.

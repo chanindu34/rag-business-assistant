@@ -14,7 +14,7 @@
   type: lookup
   question: What was the Group's recurring profit before tax in 2025/26?
   pages: [13, 14]
-  must_include: ["35.72"]
+  any_of: ["35.72", "35,723"]
 
 - id: pbt_reported
   type: lookup

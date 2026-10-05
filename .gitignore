@@ -42,3 +42,6 @@ RAG_Business_Assistant_Interview_Prep.pdf
 
 # Hugging Face model cache when HF_HOME points inside the project
 .hf/
+
+# Local evaluation console logs
+eval_*_results.txt
