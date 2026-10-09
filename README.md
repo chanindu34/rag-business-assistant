@@ -56,13 +56,12 @@ Pages 1 to 60 (overview, Chairperson's message, management discussion, Group fin
 
 These came from testing the system on real questions, using `debug_retrieval.py` to trace where the correct passage ranks at each stage (BM25, dense, fused, reranked).
 
-1. **The original index covered 16 pages, not 82.** The first ingestion embedded one chunk per API request and stopped on a quota error after 150 of 820 chunks. The app had only ever searched pages 1 to 16. Rebuilding with batched, cached embeddings took 10 requests.
-2. **Vocabulary mismatch.** "How much did Group EBITDA grow?" failed because the report says "increased by 75%", never "grew". BM25 ranked the six passages containing the answer between 46th and 159th. The router had skipped HyDE because it saw a metric and a year, so questions about change now always run HyDE.
-3. **Stemming.** For "How many hotel rooms does the Group manage?", the correct passage went from BM25 rank 16 to rank 1 once "manage" could match "management".
-4. **Reranker scores do not measure answerability.** An off-topic question ("What is the capital of France?") scored 0.31, higher than a real one whose answer retrieval ranked first (0.29). No single threshold separates them. The reranker now only orders passages and filters obvious junk; the answer model decides whether the passages contain the answer and replies `NOT_IN_REPORT` if not.
-5. **Parent context rescued a weak reranker.** For the EBITDA question the reranker placed the Group level passage 8th, below several industry group passages. A neighbouring child in the same parent made the top 6, so the model still received the answer. Sending 8 passages instead of 6 covers this case; a stronger reranker is the proper fix.
-6. **The report contradicts itself.** Page 10 gives 3,468 rooms under management "as at 31 March 2026"; page 36 gives 3,577 with no date. The assistant reports both, with citations, rather than picking one.
-7. **Prompt-only grounding has a limit.** An earlier version named an ESG initiative that appeared in none of the retrieved passages. Instructions alone did not stop it, which is why the system now has an explicit refusal path and why claim-level faithfulness checking is on the list below.
+1. **Vocabulary mismatch.** "How much did Group EBITDA grow?" failed because the report says "increased by 75%", never "grew". BM25 ranked the six passages containing the answer between 46th and 159th. The router had skipped HyDE because it saw a metric and a year, so questions about change now always run HyDE.
+2. **Stemming.** For "How many hotel rooms does the Group manage?", the correct passage went from BM25 rank 16 to rank 1 once "manage" could match "management".
+3. **Reranker scores do not measure answerability.** An off-topic question ("What is the capital of France?") scored 0.31, higher than a real one whose answer retrieval ranked first (0.29). No single threshold separates them. The reranker now only orders passages and filters obvious junk; the answer model decides whether the passages contain the answer and replies `NOT_IN_REPORT` if not.
+4. **Parent context rescued a weak reranker.** For the EBITDA question the reranker placed the Group level passage 8th, below several industry group passages. A neighbouring child in the same parent made the top 6, so the model still received the answer. Sending 8 passages instead of 6 covers this case; a stronger reranker is the proper fix.
+5. **The report contradicts itself.** Page 10 gives 3,468 rooms under management "as at 31 March 2026"; page 36 gives 3,577 with no date. The assistant reports both, with citations, rather than picking one.
+6. **Prompt-only grounding has a limit.** An earlier version named an ESG initiative that appeared in none of the retrieved passages. Instructions alone did not stop it, which is why the system now has an explicit refusal path and why claim-level faithfulness checking is on the list below.
 
 ## Evaluation results
 
